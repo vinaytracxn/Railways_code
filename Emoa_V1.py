@@ -80,9 +80,10 @@ def gspread_auth():
         "https://www.googleapis.com/auth/drive",
     ]
 
-    # Use the pre-loaded dictionary directly instead of a file path
+    # Change from_service_account_file to from_service_account_info
+    # and pass the dictionary variable directly
     creds = Credentials.from_service_account_info(
-        SERVICE_ACCOUNT_FILE,  # Pass the loaded JSON dict here
+        SERVICE_ACCOUNT_FILE,
         scopes=scope
     )
 
