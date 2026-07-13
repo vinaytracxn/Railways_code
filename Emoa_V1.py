@@ -75,9 +75,17 @@ def call_with_retry(func, *args, **kwargs):
 # ---------------- AUTH / SESSION ----------------
 
 def gspread_auth():
-    scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    credentials_info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
-    creds = Credentials.from_service_account_info(credentials_info, scopes=scope)
+    scope = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+
+    # Use the pre-loaded dictionary directly instead of a file path
+    creds = Credentials.from_service_account_info(
+        SERVICE_ACCOUNT_FILE,  # Pass the loaded JSON dict here
+        scopes=scope
+    )
+
     return gspread.authorize(creds)
 
 
