@@ -111,28 +111,36 @@ INPUT_SHEET_NAME = "Altered MOA"
 
 SESSION_FILE = json.loads(os.environ["TRACXN_SESSION_JSON"])  # created by login_and_save_session.py
 
-# extract_main_objects() below finds the Objects clause by locating the
-# "REGISTERED OFFICE OF THE COMPANY" heading and then reading the numbered
-# list that immediately follows it, rather than matching a start/end phrase
-# pair -- MOA documents phrase those boundary phrases too inconsistently
-# across filing eras/formats to match reliably.
+# MOA documents phrase the "Objects" clause boundary differently depending on
+# the era/format of the filing. START_MARKERS and END_MARKERS below list every
+# known variant seen so far (leading numbering like "3 (a)", "III.", trailing
+# punctuation/labels like ":", "3rd (a) are:", "(A)" are deliberately left out
+# of these core phrases -- they're not needed for matching since we only
+# search for the core phrase itself, wherever it sits in the surrounding
+# numbering/punctuation).
+START_MARKERS = [
+    "The objects to be pursued by the company on its incorporation are",
+    "The Objects for which the company is established are",
+    "Main objects to be pursued by the company on its incorporation are",
+    "The main objects to be pursued by the company on its incorporation are",
+    "The main Objects for which the company is established are",
+    "Main objects to be pursued on incorporation",
+    "The objects to be pusued by the company are",
+    "The object for which the company is established are",
+]
 
-# A line that starts a top-level numbered list entry, e.g. "1. To establish"
-# or "1.To establish" (no space after the dot is common in these PDFs) --
-# but NOT a sub-item like "1.1" (dot immediately followed by another digit).
-NUMERIC_ITEM_PATTERN = re.compile(r"^\s*(\d{1,3})\.(?!\d)")
-
-# A line that's nothing but a "Page X of Y" footer -- PDF extraction
-# sometimes inserts these mid-clause; they're dropped rather than kept as
-# part of the Objects text.
-PAGE_FOOTER_PATTERN = re.compile(r"^\s*PAGE\s+\d+\s+OF\s+\d+\s*$")
-
-# If no numbered item shows up within this many lines of the start marker,
-# the sighting isn't trusted as "item 1" of the Objects list (it's more
-# likely an unrelated numbered section further down a garbled/short
-# extraction) -- extraction is treated as failed rather than scanning to
-# the end of the document.
-NO_NUMERIC_3A_GAP_THRESHOLD = 50
+END_MARKERS = [
+    "Matters which are necessary for furtherance of the objects specified in clause",
+    "The furtherence of the object specified in clause",
+    "The Objects incidental or ancillary to the attainment of the above main objects",
+    "The Objects incidental or ancillary to the attainment of the main objects",
+    "Objects incidental or ancillary to the attainment of the main objects",
+    "Objects incidental and ancillary to the attainment of the main objects",
+    "Objects incidental to the attainment of the main objects",
+    "The other objects not included in objects",
+    "Objects and ancillary or",
+    "Objects, ancillary or",
+]
 
 # Column header names as they appear in row 1 of the input sheet
 CIN_HEADER = "CIN"
@@ -445,66 +453,37 @@ def extract_pdf_text(pdf_file: io.BytesIO) -> str:
 
 
 def extract_main_objects(text: str) -> str:
-    """Extract the Objects clause by finding the "REGISTERED OFFICE OF THE
-    COMPANY" heading and then reading the numbered list (1., 2., 3., ...)
-    that follows it. Stops when either:
-      - the numbering restarts at "1." after having reached at least "2."
-        (a different numbered section, e.g. "objects incidental or
-        ancillary", has begun), or
-      - the first numbered item found is implausibly far (more than
-        NO_NUMERIC_3A_GAP_THRESHOLD lines) from the start marker.
-    If neither happens, the list is taken to run to the end of the text.
+    """Extract text between the earliest matching start marker and the
+    earliest following end marker, tolerant of the inconsistent
+    whitespace/line-breaks PDF extraction tends to introduce. Tries every
+    known phrasing variant in START_MARKERS / END_MARKERS -- MOA documents
+    from different eras/formats word this boundary differently.
 
-    Returns "" if the start marker isn't found, or if no numbered item is
-    ever found after it (nothing usable to extract)."""
+    Returns "" if no start/end marker pair matched."""
 
-    lines = text.splitlines()
+    def to_flexible_pattern(marker: str) -> str:
+        return r"\s+".join(re.escape(word) for word in marker.split())
 
-    start_idx = None
-    stop_idx = None
-    last_item_num = 0
+    start_alternation = "|".join(to_flexible_pattern(m) for m in START_MARKERS)
+    end_alternation = "|".join(to_flexible_pattern(m) for m in END_MARKERS)
 
-    for i, line in enumerate(lines):
-        u = line.upper()
-        if start_idx is None:
-            if "REGISTERED OFFICE OF THE COMPANY" in u:
-                start_idx = i + 1
-            continue
-
-        m = NUMERIC_ITEM_PATTERN.match(line)
-        if m:
-            num = int(m.group(1))
-            if num == 1 and last_item_num >= 2:
-                stop_idx = i
-                break
-            if last_item_num == 0 and (i - start_idx) > NO_NUMERIC_3A_GAP_THRESHOLD:
-                stop_idx = i
-                break
-            last_item_num = num
-
-    if start_idx is None or last_item_num == 0:
-        # Never found the heading, or found it but never saw a single
-        # numbered item after it -- nothing usable to extract.
+    pattern = re.compile(
+        rf"(?:{start_alternation})\s*(.*?)\s*(?:{end_alternation})",
+        re.IGNORECASE | re.DOTALL,
+    )
+    match = pattern.search(text)
+    if not match:
+        norm = re.sub(r"\s+", " ", text)
+        idx = norm.lower().find("objects to be pursued")
+        if idx == -1:
+            idx = norm.lower().find("object")
+        if idx != -1:
+            print(f"    [debug] Nearby text: ...{norm[max(0, idx - 30):idx + 200]}...")
+        else:
+            print(f"    [debug] 'object' not found anywhere in extracted text "
+                  f"({len(norm)} chars total). PDF text extraction may have failed.")
         return ""
-
-    if stop_idx is None:
-        # Numbering never restarted and no gap-timeout fired -- the list
-        # runs to the end of the extracted text.
-        stop_idx = len(lines)
-
-    if stop_idx <= start_idx:
-        return ""
-
-    out = []
-    for line in lines[start_idx:stop_idx]:
-        u = line.upper()
-        if PAGE_FOOTER_PATTERN.match(u):
-            continue
-        if "OBJECTS TO BE PURSUED BY THE COMPANY" in u:
-            continue
-        out.append(line)
-
-    return re.sub(r"\s+", " ", " ".join(out)).strip()
+    return re.sub(r"\s+", " ", match.group(1)).strip()
 
 
 def build_extraction_result(raw_text: str) -> tuple:
