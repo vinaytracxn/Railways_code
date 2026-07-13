@@ -21,6 +21,23 @@ fast-download-then-Playwright-fallback approach as before) and extracts the
                               full raw extracted text instead
         * ""              -- for "Content not available" / "Photo pdf" rows
                               (nothing meaningful to label)
+        * "Skipped"       -- this row's CIN already had a usable result from
+                              an earlier document, so this document was
+                              never even downloaded; `extraction` holds
+                              "Skipped - CIN already extracted"
+
+PER-CIN CASCADE: a company (CIN) is often filed multiple times, so each CIN
+can have several document rows. Rather than extracting every document for
+every CIN, rows for the same CIN are tried in sheet order, one at a time --
+as soon as one document yields a usable result ("clause 3a" or
+"Full Extract"), the remaining documents for that CIN are marked "Skipped"
+and never downloaded/extracted. A document only "falls through" to the next
+one for the same CIN when it comes back as a genuine failure -- "Content not
+available" or "Photo pdf" -- not merely because clause 3a's markers didn't
+match (that still counts as a usable "Full Extract" result and stops the
+cascade). This holds even if a CIN's documents happen to land in different
+INPUT_BATCH_SIZE chunks, and also across separate runs of the script (a
+CIN with an existing successful/skipped row is recognized on resume).
 
 SCANNED/PHOTO PDFs: when a PDF has no embedded text layer, each page is
 rasterized with PyMuPDF (fitz) and OCR'd with pytesseract automatically,
@@ -56,7 +73,7 @@ just a Python wrapper around it):
     Ubuntu/Debian:  sudo apt-get install tesseract-ocr
     Windows:        https://github.com/UB-Mannheim/tesseract/wiki
 """
-
+import os
 import io
 import re
 import json
@@ -66,6 +83,7 @@ import threading
 import requests
 import PyPDF2
 import gspread
+
 try:
     # PyMuPDF's newer canonical import name -- avoids a name collision with
     # an unrelated PyPI package that is also literally called "fitz".
@@ -80,48 +98,41 @@ from PIL import Image
 # default decompression-bomb pixel threshold. This isn't an untrusted image
 # upload, so it's safe to disable that safety cap here.
 Image.MAX_IMAGE_PIXELS = None
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from playwright.sync_api import sync_playwright
 from google.oauth2.service_account import Credentials
 
 # ---------------- CONFIG ----------------
-SERVICE_ACCOUNT_FILE = "/Users/vinay/Desktop/json/ss.json"
+SERVICE_ACCOUNT_FILE = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
 
-INPUT_SPREADSHEET_ID = "153Me-s4onihi3KAIAcxidcYRbNxstO2EUjHvQwtNsAw"
+INPUT_SPREADSHEET_ID = os.environ["SHEET_ID"]
 INPUT_SHEET_NAME = "Altered MOA"
 
-SESSION_FILE = "tracxn_session.json"  # created by login_and_save_session.py
+SESSION_FILE = json.loads(os.environ["TRACXN_SESSION_JSON"])  # created by login_and_save_session.py
 
-# MOA documents phrase the "Objects" clause boundary differently depending on
-# the era/format of the filing. START_MARKERS and END_MARKERS below list every
-# known variant seen so far (leading numbering like "3 (a)", "III.", trailing
-# punctuation/labels like ":", "3rd (a) are:", "(A)" are deliberately left out
-# of these core phrases -- they're not needed for matching since we only
-# search for the core phrase itself, wherever it sits in the surrounding
-# numbering/punctuation).
-START_MARKERS = [
-    "The objects to be pursued by the company on its incorporation are",
-    "The Objects for which the company is established are",
-    "Main objects to be pursued by the company on its incorporation are",
-    "The main objects to be pursued by the company on its incorporation are",
-    "The main Objects for which the company is established are",
-    "Main objects to be pursued on incorporation",
-    "The objects to be pusued by the company are",
-    "The object for which the company is established are",
-]
+# extract_main_objects() below finds the Objects clause by locating the
+# "REGISTERED OFFICE OF THE COMPANY" heading and then reading the numbered
+# list that immediately follows it, rather than matching a start/end phrase
+# pair -- MOA documents phrase those boundary phrases too inconsistently
+# across filing eras/formats to match reliably.
 
-END_MARKERS = [
-    "Matters which are necessary for furtherance of the objects specified in clause",
-    "The furtherence of the object specified in clause",
-    "The Objects incidental or ancillary to the attainment of the above main objects",
-    "The Objects incidental or ancillary to the attainment of the main objects",
-    "Objects incidental or ancillary to the attainment of the main objects",
-    "Objects incidental and ancillary to the attainment of the main objects",
-    "Objects incidental to the attainment of the main objects",
-    "The other objects not included in objects",
-    "Objects and ancillary or",
-    "Objects, ancillary or",
-]
+# A line that starts a top-level numbered list entry, e.g. "1. To establish"
+# or "1.To establish" (no space after the dot is common in these PDFs) --
+# but NOT a sub-item like "1.1" (dot immediately followed by another digit).
+NUMERIC_ITEM_PATTERN = re.compile(r"^\s*(\d{1,3})\.(?!\d)")
+
+# A line that's nothing but a "Page X of Y" footer -- PDF extraction
+# sometimes inserts these mid-clause; they're dropped rather than kept as
+# part of the Objects text.
+PAGE_FOOTER_PATTERN = re.compile(r"^\s*PAGE\s+\d+\s+OF\s+\d+\s*$")
+
+# If no numbered item shows up within this many lines of the start marker,
+# the sighting isn't trusted as "item 1" of the Objects list (it's more
+# likely an unrelated numbered section further down a garbled/short
+# extraction) -- extraction is treated as failed rather than scanning to
+# the end of the document.
+NO_NUMERIC_3A_GAP_THRESHOLD = 50
 
 # Column header names as they appear in row 1 of the input sheet
 CIN_HEADER = "CIN"
@@ -135,8 +146,20 @@ STATUS_HEADER = "extraction_status"  # NEW -- col F: "clause 3a" / "Full Extract
 STATUS_CLAUSE_MATCHED = "clause 3a"
 STATUS_FULL_EXTRACT = "Full Extract"
 STATUS_NONE = ""
+STATUS_SKIPPED = "Skipped"  # this row's CIN already had a successful extraction elsewhere
 
-PREFETCH_WORKERS = 8    # parallel threads used for the fast direct-download pass
+# Written to the EXTRACTION_HEADER cell for rows skipped because another
+# document for the same CIN already produced a usable result.
+SKIPPED_EXTRACTION_TEXT = "Skipped - CIN already extracted"
+
+# extraction_value outcomes that count as "this document was not readable"
+# for the purposes of the per-CIN cascade below -- these (and only these)
+# are what trigger trying the *next* document for the same CIN. A
+# "Full Extract" (markers just didn't match) still counts as a usable
+# result and stops the cascade for that CIN.
+FAILURE_EXTRACTION_VALUES = {"Content not available", "Photo pdf"}
+
+PREFETCH_WORKERS = 8  # parallel threads used for the fast direct-download pass
 INPUT_BATCH_SIZE = 100  # how many input rows to read/process/write at a time
 EXTRACTION_WORKERS = 25  # parallel threads used to extract/parse documents per batch
 
@@ -164,9 +187,9 @@ def call_with_retry(func, *args, **kwargs):
         try:
             return func(*args, **kwargs)
         except (
-            requests.exceptions.RequestException,
-            OSError,
-            gspread.exceptions.APIError,
+                requests.exceptions.RequestException,
+                OSError,
+                gspread.exceptions.APIError,
         ) as e:
             last_exc = e
             if attempt == SHEETS_MAX_RETRIES:
@@ -186,16 +209,34 @@ def gspread_auth():
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scope)
+
+    credentials_info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
+
+    creds = Credentials.from_service_account_info(
+        credentials_info,
+        scopes=scope
+    )
+
     return gspread.authorize(creds)
 
 
-def load_cookies_from_session(session_file: str) -> dict:
-    """Load cookies out of a Playwright storage_state JSON file, in a form
-    usable directly by the `requests` library."""
-    with open(session_file, "r") as f:
-        state = json.load(f)
-    return {c["name"]: c["value"] for c in state.get("cookies", [])}
+def load_cookies_from_session():
+    storage = json.loads(os.environ["TRACXN_SESSION_JSON"])
+
+    cookie_dict = {}
+
+    for c in storage["cookies"]:
+        cookie_dict[c["name"]] = str(c["value"])
+
+    return cookie_dict
+
+
+# def load_cookies_from_session(session_file: str) -> dict:
+#     """Load cookies out of a Playwright storage_state JSON file, in a form
+#     usable directly by the `requests` library."""
+#     with open(session_file, "r") as f:
+#         state = json.load(f)
+#     return {c["name"]: c["value"] for c in state.get("cookies", [])}
 
 
 # ---------------- PDF FETCHING (unchanged logic) ----------------
@@ -212,6 +253,12 @@ def try_direct_download(url: str, cookies: dict):
             timeout=30,
             allow_redirects=True,
         )
+        print("Status:", response.status_code)
+        print("Content-Type:", response.headers.get("Content-Type"))
+        print("Length:", len(response.content))
+
+        if response.status_code == 200:
+            print(response.content[:100])
         if response.status_code == 200 and response.content.startswith(b"%PDF"):
             return io.BytesIO(response.content)
     except requests.RequestException:
@@ -356,7 +403,7 @@ def is_scanned_photo_pdf(text: str) -> bool:
 
 # ---------------- OCR FALLBACK (for scanned/photo PDFs) ----------------
 
-OCR_DPI = 300          # higher = more accurate OCR but slower/more memory
+OCR_DPI = 300  # higher = more accurate OCR but slower/more memory
 OCR_LANGUAGE = "eng"
 
 # If `tesseract --version` works in your terminal but the script still can't
@@ -398,37 +445,66 @@ def extract_pdf_text(pdf_file: io.BytesIO) -> str:
 
 
 def extract_main_objects(text: str) -> str:
-    """Extract text between the earliest matching start marker and the
-    earliest following end marker, tolerant of the inconsistent
-    whitespace/line-breaks PDF extraction tends to introduce. Tries every
-    known phrasing variant in START_MARKERS / END_MARKERS -- MOA documents
-    from different eras/formats word this boundary differently.
+    """Extract the Objects clause by finding the "REGISTERED OFFICE OF THE
+    COMPANY" heading and then reading the numbered list (1., 2., 3., ...)
+    that follows it. Stops when either:
+      - the numbering restarts at "1." after having reached at least "2."
+        (a different numbered section, e.g. "objects incidental or
+        ancillary", has begun), or
+      - the first numbered item found is implausibly far (more than
+        NO_NUMERIC_3A_GAP_THRESHOLD lines) from the start marker.
+    If neither happens, the list is taken to run to the end of the text.
 
-    Returns "" if no start/end marker pair matched."""
+    Returns "" if the start marker isn't found, or if no numbered item is
+    ever found after it (nothing usable to extract)."""
 
-    def to_flexible_pattern(marker: str) -> str:
-        return r"\s+".join(re.escape(word) for word in marker.split())
+    lines = text.splitlines()
 
-    start_alternation = "|".join(to_flexible_pattern(m) for m in START_MARKERS)
-    end_alternation = "|".join(to_flexible_pattern(m) for m in END_MARKERS)
+    start_idx = None
+    stop_idx = None
+    last_item_num = 0
 
-    pattern = re.compile(
-        rf"(?:{start_alternation})\s*(.*?)\s*(?:{end_alternation})",
-        re.IGNORECASE | re.DOTALL,
-    )
-    match = pattern.search(text)
-    if not match:
-        norm = re.sub(r"\s+", " ", text)
-        idx = norm.lower().find("objects to be pursued")
-        if idx == -1:
-            idx = norm.lower().find("object")
-        if idx != -1:
-            print(f"    [debug] Nearby text: ...{norm[max(0, idx-30):idx+200]}...")
-        else:
-            print(f"    [debug] 'object' not found anywhere in extracted text "
-                  f"({len(norm)} chars total). PDF text extraction may have failed.")
+    for i, line in enumerate(lines):
+        u = line.upper()
+        if start_idx is None:
+            if "REGISTERED OFFICE OF THE COMPANY" in u:
+                start_idx = i + 1
+            continue
+
+        m = NUMERIC_ITEM_PATTERN.match(line)
+        if m:
+            num = int(m.group(1))
+            if num == 1 and last_item_num >= 2:
+                stop_idx = i
+                break
+            if last_item_num == 0 and (i - start_idx) > NO_NUMERIC_3A_GAP_THRESHOLD:
+                stop_idx = i
+                break
+            last_item_num = num
+
+    if start_idx is None or last_item_num == 0:
+        # Never found the heading, or found it but never saw a single
+        # numbered item after it -- nothing usable to extract.
         return ""
-    return re.sub(r"\s+", " ", match.group(1)).strip()
+
+    if stop_idx is None:
+        # Numbering never restarted and no gap-timeout fired -- the list
+        # runs to the end of the extracted text.
+        stop_idx = len(lines)
+
+    if stop_idx <= start_idx:
+        return ""
+
+    out = []
+    for line in lines[start_idx:stop_idx]:
+        u = line.upper()
+        if PAGE_FOOTER_PATTERN.match(u):
+            continue
+        if "OBJECTS TO BE PURSUED BY THE COMPANY" in u:
+            continue
+        out.append(line)
+
+    return re.sub(r"\s+", " ", " ".join(out)).strip()
 
 
 def build_extraction_result(raw_text: str) -> tuple:
@@ -448,7 +524,7 @@ def build_extraction_result(raw_text: str) -> tuple:
 
 
 def extract_doc_text_parallel(context, cookies: dict, browser_lock: threading.Lock,
-                               doc_url: str, prefetched_bytes: bytes = None) -> tuple:
+                              doc_url: str, prefetched_bytes: bytes = None) -> tuple:
     """Thread-safe extraction pipeline for use inside a ThreadPoolExecutor.
 
     Playwright's sync API is NOT thread-safe, so any call that touches the
@@ -473,7 +549,9 @@ def extract_doc_text_parallel(context, cookies: dict, browser_lock: threading.Lo
             with browser_lock:
                 pdf_file = fetch_pdf_via_page(context, doc_url)
             pdf_bytes = pdf_file.getvalue()
-
+    print("PDF size:", len(pdf_bytes))
+    print("First 20 bytes:", pdf_bytes[:20])
+    print("Last 20 bytes:", pdf_bytes[-20:])
     pdf_text = extract_pdf_text(io.BytesIO(pdf_bytes))
 
     if is_unsupported_xfa_placeholder(pdf_text):
@@ -534,6 +612,45 @@ def prefetch_direct_downloads(links, cookies: dict) -> dict:
     return results
 
 
+def extract_links_parallel(context, cookies: dict, browser_lock: threading.Lock,
+                           links, extracted_result_cache: dict):
+    """Prefetches + extracts every link in `links` that isn't already present
+    in `extracted_result_cache`, mutating the cache in place with
+    {link: (extraction_value, status_value)}. Used both for a plain batch
+    pass and for each round of the per-CIN cascade in process_sheet()."""
+    links_to_fetch = sorted(set(links) - set(extracted_result_cache.keys()))
+    if not links_to_fetch:
+        return
+
+    prefetch_cache = prefetch_direct_downloads(links_to_fetch, cookies)
+
+    print(f"  Extracting {len(links_to_fetch)} not-yet-cached document(s) "
+          f"with up to {EXTRACTION_WORKERS} parallel workers...")
+
+    with ThreadPoolExecutor(max_workers=EXTRACTION_WORKERS) as executor:
+        future_to_link = {
+            executor.submit(
+                extract_doc_text_parallel,
+                context, cookies, browser_lock, link,
+                prefetch_cache.get(link),
+            ): link
+            for link in links_to_fetch
+        }
+        done = 0
+        for future in as_completed(future_to_link):
+            link = future_to_link[future]
+            try:
+                extract_text, status_value = future.result()
+            except Exception:
+                import traceback
+                traceback.print_exc()
+                extract_text, status_value = "Content not available", STATUS_NONE
+            extracted_result_cache[link] = (extract_text, status_value)
+            done += 1
+            if done % 10 == 0 or done == len(links_to_fetch):
+                print(f"    Extraction progress: {done}/{len(links_to_fetch)}")
+
+
 # ---------------- HEADER PARSING ----------------
 
 def parse_header(header_row):
@@ -560,8 +677,8 @@ def parse_header(header_row):
     missing = [h for h in required if h not in indices]
     if missing:
         raise ValueError(f"Could not find column(s) {missing} in header row: {header_row}. "
-                          f"Make sure the sheet has an '{STATUS_HEADER}' column (col F) "
-                          f"in addition to '{EXTRACTION_HEADER}' (col E).")
+                         f"Make sure the sheet has an '{STATUS_HEADER}' column (col F) "
+                         f"in addition to '{EXTRACTION_HEADER}' (col E).")
 
     return indices
 
@@ -584,7 +701,7 @@ def col_num_to_letter(n: int) -> str:
 # ---------------- IN-PLACE COLUMN WRITE ----------------
 
 def write_column_values(input_sheet, batch_start, batch_end, col_idx,
-                         chunk_rows, new_values_by_row, label):
+                        chunk_rows, new_values_by_row, label):
     """Writes a single column back for rows batch_start..batch_end.
     Rows present in new_values_by_row get their freshly computed value;
     any other row in the range keeps whatever was already in that cell
@@ -626,7 +743,8 @@ def process_sheet():
     print(f"Header parsed: CIN col {cin_idx}, Link col {link_idx}, "
           f"extraction col {extraction_idx}, extraction_status col {status_idx}")
 
-    cookies = load_cookies_from_session(SESSION_FILE)
+    cookies = load_cookies_from_session()
+    # cookies = load_cookies_from_session(SESSION_FILE)
 
     last_col_needed = max(indices.values())
     last_col_letter = col_num_to_letter(last_col_needed + 1)
@@ -634,6 +752,13 @@ def process_sheet():
 
     # doc_link -> (extraction_value, status_value), shared across all batches
     extracted_result_cache = {}
+
+    # CIN -> True once ANY document for that CIN has yielded a real,
+    # non-failure extraction (in this run or a previous one, per the sheet).
+    # Once True, remaining documents for that CIN are skipped rather than
+    # extracted. Shared across all batches so a CIN whose docs happen to
+    # straddle a batch boundary is still handled correctly.
+    cin_satisfied = {}
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -655,12 +780,15 @@ def process_sheet():
             print(f"\n=== Batch: input rows {batch_start}-{batch_end} "
                   f"({len(chunk_rows)} fetched) ===")
 
-            # ---- Pass 1 (in-memory): figure out which rows in this chunk
-            # need extracting. A row is skipped if it has no CIN (trailing
-            # blank row), no Link (nothing to extract), or already has a
-            # non-empty `extraction` value (resume support).
-            row_infos = []  # (sheet_row_number, link)
-            unique_links = set()
+            # ---- Pass 1 (in-memory): group this chunk's rows by CIN, in
+            # sheet order, and figure out which ones are actual candidates
+            # to extract. A row is excluded if it has no CIN (trailing blank
+            # row), no Link (nothing to extract), or already has a
+            # non-empty `extraction` value (resume support). While scanning
+            # already-processed rows we also update `cin_satisfied` so a
+            # CIN whose first document already succeeded (this run or a
+            # previous one) has its other documents skipped.
+            cin_docs = OrderedDict()  # cin -> [{"row": n, "link": url}, ...] in sheet order
             any_data_in_chunk = False
             skipped_already_processed = 0
             skipped_no_link = 0
@@ -672,9 +800,12 @@ def process_sheet():
                     continue
                 any_data_in_chunk = True
 
-                already_processed = bool(safe_get(row, extraction_idx))
-                if already_processed:
+                existing_extraction = safe_get(row, extraction_idx)
+                if existing_extraction:
                     skipped_already_processed += 1
+                    existing_status = safe_get(row, status_idx)
+                    if existing_status in (STATUS_CLAUSE_MATCHED, STATUS_FULL_EXTRACT, STATUS_SKIPPED):
+                        cin_satisfied[cin] = True
                     continue
 
                 link = safe_get(row, link_idx)
@@ -682,8 +813,7 @@ def process_sheet():
                     skipped_no_link += 1
                     continue
 
-                row_infos.append((sheet_row_number, link))
-                unique_links.add(link)
+                cin_docs.setdefault(cin, []).append({"row": sheet_row_number, "link": link})
 
             if not any_data_in_chunk:
                 # Reached trailing blank rows -- nothing left to process.
@@ -696,64 +826,79 @@ def process_sheet():
             if skipped_no_link:
                 print(f"  Skipping {skipped_no_link} row(s) with no Link value.")
 
-            if not row_infos:
+            if not cin_docs:
                 # Everything in this chunk was already processed or had no
                 # link -- move on without touching prefetch/extraction/output.
                 print("  Nothing new to process in this batch.")
                 current_row = batch_end + 1
                 continue
 
-            print(f"  {len(row_infos)} document rows in this batch; "
-                  f"{len(unique_links)} unique documents to extract.")
+            total_candidate_rows = sum(len(v) for v in cin_docs.values())
+            print(f"  {total_candidate_rows} document row(s) across {len(cin_docs)} CIN(s) "
+                  f"to consider (cascading per CIN: stop at the first usable document).")
 
-            # ---- Pass 2: prefetch this batch's unique links in parallel.
-            prefetch_cache = prefetch_direct_downloads(unique_links, cookies)
-
-            # ---- Pass 3: extract every not-yet-cached unique document in
-            # this batch, up to EXTRACTION_WORKERS at a time. Most docs hit
-            # the prefetch cache (or a fresh direct download), which is
-            # pure in-memory/HTTP work and runs fully in parallel; only the
-            # rare Playwright fallback is serialized via browser_lock inside
-            # extract_doc_text_parallel.
-            docs_to_extract = sorted(
-                link for link in unique_links if link not in extracted_result_cache
-            )
-            print(f"  Extracting {len(docs_to_extract)} not-yet-cached document(s) "
-                  f"with up to {EXTRACTION_WORKERS} parallel workers...")
-
-            if docs_to_extract:
-                with ThreadPoolExecutor(max_workers=EXTRACTION_WORKERS) as executor:
-                    future_to_link = {
-                        executor.submit(
-                            extract_doc_text_parallel,
-                            context, cookies, browser_lock, link,
-                            prefetch_cache.get(link),
-                        ): link
-                        for link in docs_to_extract
-                    }
-                    done = 0
-                    for future in as_completed(future_to_link):
-                        link = future_to_link[future]
-                        try:
-                            extract_text, status_value = future.result()
-                        except Exception as e:
-                            extract_text, status_value = "Content not available", STATUS_NONE
-                            print(f"  Error extracting doc (PDF/Playwright failure): {e}")
-                        extracted_result_cache[link] = (extract_text, status_value)
-                        done += 1
-                        if done % 10 == 0 or done == len(docs_to_extract):
-                            print(f"    Extraction progress: {done}/{len(docs_to_extract)}")
-
-            # ---- Pass 4: assemble the new extraction/status values per row
-            # from the (now fully populated) result cache. Pure in-memory work.
+            # ---- Pass 2/3 (cascading): for each CIN, try its documents in
+            # sheet order, one at a time. Every CIN's "current" candidate is
+            # extracted together in parallel each round. A CIN drops out of
+            # the cascade once a document succeeds (its remaining docs are
+            # marked Skipped) or it runs out of documents (the last failure
+            # is recorded as the result).
             new_extraction_values = {}
             new_status_values = {}
-            for sheet_row_number, link in row_infos:
-                extract_text, status_value = extracted_result_cache.get(
-                    link, ("Content not available", STATUS_NONE)
+
+            pending = {cin: list(docs) for cin, docs in cin_docs.items()}
+
+            # CINs already known-satisfied (from an earlier batch or a
+            # previous run) skip straight to "Skipped" with no extraction.
+            for cin in list(pending.keys()):
+                if cin_satisfied.get(cin):
+                    for d in pending[cin]:
+                        new_extraction_values[d["row"]] = SKIPPED_EXTRACTION_TEXT
+                        new_status_values[d["row"]] = STATUS_SKIPPED
+                    del pending[cin]
+
+            round_num = 0
+            while pending:
+                round_num += 1
+                round_targets = {}  # sheet_row_number -> link
+                row_to_cin = {}
+                for cin, docs in pending.items():
+                    head = docs[0]
+                    round_targets[head["row"]] = head["link"]
+                    row_to_cin[head["row"]] = cin
+
+                print(f"  Cascade round {round_num}: attempting {len(round_targets)} "
+                      f"document(s) (one per still-open CIN)...")
+
+                extract_links_parallel(
+                    context, cookies, browser_lock,
+                    round_targets.values(), extracted_result_cache,
                 )
-                new_extraction_values[sheet_row_number] = truncate_for_sheet_cell(extract_text)
-                new_status_values[sheet_row_number] = status_value
+
+                for row, link in round_targets.items():
+                    cin = row_to_cin[row]
+                    extract_text, status_value = extracted_result_cache.get(
+                        link, ("Content not available", STATUS_NONE)
+                    )
+                    pending[cin].pop(0)  # this document has now been attempted
+
+                    if extract_text in FAILURE_EXTRACTION_VALUES and pending[cin]:
+                        # Not readable, but there's another document for
+                        # this CIN left to try next round.
+                        new_extraction_values[row] = extract_text
+                        new_status_values[row] = status_value
+                        continue
+
+                    # Either it succeeded, or it failed with nothing left to
+                    # try -- either way this CIN's cascade is finished.
+                    new_extraction_values[row] = truncate_for_sheet_cell(extract_text)
+                    new_status_values[row] = status_value
+                    if extract_text not in FAILURE_EXTRACTION_VALUES:
+                        cin_satisfied[cin] = True
+                        for d in pending[cin]:
+                            new_extraction_values[d["row"]] = SKIPPED_EXTRACTION_TEXT
+                            new_status_values[d["row"]] = STATUS_SKIPPED
+                    del pending[cin]
 
             # ---- Write this batch's `extraction` and `extraction_status`
             # values in-place before moving to the next chunk of input rows.
