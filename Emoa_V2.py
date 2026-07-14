@@ -7,11 +7,6 @@ the result into column F of the same row.
 
 Also writes the extraction status (e.g., "Clause3a", "Skipped", "Error") into
 column G.
-
-OPTIMIZED FOR SORTED DATA (CIN -> Date Newest First):
-Groups rows by CIN within each batch so that a single thread processes a company's
-documents strictly sequentially. This guarantees the newest document is attempted
-first, completely avoiding race conditions.
 """
 
 import os
@@ -27,7 +22,6 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 # ------------------------- CONFIG -------------------------
-# Load sensitive data directly from environment variables
 GOOGLE_SERVICE_ACCOUNT_INFO = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
 TRACXN_SESSION_DATA = json.loads(os.environ["TRACXN_SESSION_JSON"])
 
@@ -40,13 +34,16 @@ OUTPUT_COL_LETTER = "F"
 STATUS_COL_LETTER = "G"
 START_ROW = 2
 BATCH_SIZE = 100
-WRITE_BATCH_SIZE = 100
+WRITE_BATCH_SIZE = 25
 MAX_WORKERS = 8
 REQUEST_DELAY_SECONDS = 0.3
+
+# Limit to 30,000 characters per cell to prevent API errors and excessive cell sizes
+MAX_CELL_CHARS = 30000
 # ------------------------------------------------------------
 
 _thread_local = threading.local()
-successful_cins = set()  # Tracks CINs that have been successfully extracted globally
+successful_cins = set()
 
 
 def col_letter_to_index(letter: str) -> int:
@@ -175,10 +172,6 @@ def get_thread_session(cookies: list[dict]) -> requests.Session:
 
 
 def process_cin_group(cin: str, rows_list: list[tuple[int, str]], cookies: list[dict]) -> list[tuple[int, str, str]]:
-    """
-    Processes a list of rows for the SAME CIN sequentially (newest to oldest).
-    Returns a list of tuples: (row, extracted_text, extraction_status)
-    """
     results = []
     sess = get_thread_session(cookies)
 
@@ -211,14 +204,12 @@ def process_cin_group(cin: str, rows_list: list[tuple[int, str]], cookies: list[
             status_value = "Error"
 
         results.append((row, cell_value, status_value))
-
         time.sleep(REQUEST_DELAY_SECONDS)
 
     return results
 
 
 def main():
-    # 1. Authorize Google Sheets API using the dictionary loaded from environment
     creds = Credentials.from_service_account_info(
         GOOGLE_SERVICE_ACCOUNT_INFO,
         scopes=["https://www.googleapis.com/auth/spreadsheets"],
@@ -234,10 +225,8 @@ def main():
     col_link_values = ws.col_values(link_col_idx)
     col_out_values = ws.col_values(out_col_idx)
 
-    # 2. Extract cookies from the loaded session dictionary
     cookies = TRACXN_SESSION_DATA.get("cookies", [])
 
-    # Pre-populate `successful_cins` from data ALREADY in the sheet
     for i, out_val in enumerate(col_out_values):
         out_str = out_val.strip()
         if out_str and not out_str.startswith("Skipped") and not out_str.startswith("[") and not out_str.startswith(
@@ -297,6 +286,16 @@ def main():
             batch_updates = []
             for row, cin, link in sub_chunk:
                 cell_value, status_value = results_dict.get(row, ("ERROR: Missing result", "Error"))
+
+                # --- TRUNCATE TEXT IF OVER 30,000 CHARS ---
+                if len(cell_value) > MAX_CELL_CHARS:
+                    cell_value = cell_value[:MAX_CELL_CHARS] + "\n\n...[TRUNCATED DUE TO 30K CHAR LIMIT]"
+                    if status_value == "Clause3a":
+                        status_value = "Clause3a (Truncated)"
+                    elif not status_value.endswith("(Truncated)"):
+                        status_value = f"{status_value} (Truncated)"
+                # ----------------------------------------
+
                 preview = cell_value[:60].replace("\n", " ")
 
                 print(f"  Row {row}: [{status_value}] {preview}...")
