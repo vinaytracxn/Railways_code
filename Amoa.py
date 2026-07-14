@@ -56,7 +56,7 @@ just a Python wrapper around it):
     Ubuntu/Debian:  sudo apt-get install tesseract-ocr
     Windows:        https://github.com/UB-Mannheim/tesseract/wiki
 """
-
+import os
 import io
 import re
 import json
