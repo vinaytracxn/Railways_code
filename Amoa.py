@@ -85,12 +85,18 @@ from playwright.sync_api import sync_playwright
 from google.oauth2.service_account import Credentials
 
 # ---------------- CONFIG ----------------
-SERVICE_ACCOUNT_FILE = "/Users/vinay/Desktop/json/ss.json"
+# SERVICE_ACCOUNT_FILE = "/Users/vinay/Desktop/json/ss.json"
+#
+# INPUT_SPREADSHEET_ID = "1siNgkqlYwQpROQbf6mp8uIKXmyvCg3oFm8_L32PiJZw"
+# INPUT_SHEET_NAME = "Altered MOA"
+#
+# SESSION_FILE = "tracxn_session.json"  # created by login_and_save_session.py
 
-INPUT_SPREADSHEET_ID = "1siNgkqlYwQpROQbf6mp8uIKXmyvCg3oFm8_L32PiJZw"
+GOOGLE_SERVICE_ACCOUNT_INFO = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
+TRACXN_SESSION_DATA = json.loads(os.environ["TRACXN_SESSION_JSON"])
+
+INPUT_SPREADSHEET_ID = os.environ["SHEET_ID"]
 INPUT_SHEET_NAME = "Altered MOA"
-
-SESSION_FILE = "tracxn_session.json"  # created by login_and_save_session.py
 
 # MOA documents phrase the "Objects" clause boundary differently depending on
 # the era/format of the filing. START_MARKERS and END_MARKERS below list every
@@ -186,16 +192,26 @@ def gspread_auth():
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scope)
+
+    credentials_info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
+
+    creds = Credentials.from_service_account_info(
+        credentials_info,
+        scopes=scope
+    )
+
     return gspread.authorize(creds)
 
 
-def load_cookies_from_session(session_file: str) -> dict:
-    """Load cookies out of a Playwright storage_state JSON file, in a form
-    usable directly by the `requests` library."""
-    with open(session_file, "r") as f:
-        state = json.load(f)
-    return {c["name"]: c["value"] for c in state.get("cookies", [])}
+def load_cookies_from_session():
+    storage = json.loads(os.environ["TRACXN_SESSION_JSON"])
+
+    cookie_dict = {}
+
+    for c in storage["cookies"]:
+        cookie_dict[c["name"]] = str(c["value"])
+
+    return cookie_dict
 
 
 # ---------------- PDF FETCHING (unchanged logic) ----------------
