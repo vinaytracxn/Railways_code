@@ -27,7 +27,7 @@ GOOGLE_SERVICE_ACCOUNT_INFO = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON
 TRACXN_SESSION_DATA = json.loads(os.environ["TRACXN_SESSION_JSON"])
 
 INPUT_SPREADSHEET_ID = os.environ["SHEET_ID"]
-INPUT_SHEET_NAME = "Altered MOA"
+INPUT_SHEET_NAME = "Sheet1"
 
 # Read the start row from env, default to 2 (first data row) if not provided
 START_ROW = int(os.environ.get("START_ROW", "2"))
