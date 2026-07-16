@@ -62,8 +62,8 @@ STATUS_FULL_EXTRACT = "Full Extract"
 STATUS_NONE = ""
 
 PREFETCH_WORKERS = 8
-INPUT_BATCH_SIZE = 100
-EXTRACTION_WORKERS = 25
+INPUT_BATCH_SIZE = 40
+EXTRACTION_WORKERS = 5
 
 # Retry settings
 SHEETS_MAX_RETRIES = 5
@@ -75,15 +75,16 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
 
+
 def call_with_retry(func, *args, **kwargs):
     last_exc = None
     for attempt in range(1, SHEETS_MAX_RETRIES + 1):
         try:
             return func(*args, **kwargs)
         except (
-            requests.exceptions.RequestException,
-            OSError,
-            gspread.exceptions.APIError,
+                requests.exceptions.RequestException,
+                OSError,
+                gspread.exceptions.APIError,
         ) as e:
             last_exc = e
             if attempt == SHEETS_MAX_RETRIES:
@@ -103,7 +104,6 @@ def gspread_auth():
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    # FIX: Use the dictionary loaded from os.environ
     creds = Credentials.from_service_account_info(GOOGLE_SERVICE_ACCOUNT_INFO, scopes=scope)
     return gspread.authorize(creds)
 
@@ -155,7 +155,6 @@ def fetch_pdf_via_direct_download(context, doc_url: str) -> io.BytesIO:
 
     if not content.startswith(b"%PDF"):
         print("  WARNING: Downloaded content does not look like a PDF.")
-        print(f"  First 300 bytes: {content[:300]!r}")
         raise Exception("Downloaded content is not a valid PDF")
 
     return io.BytesIO(content)
@@ -214,14 +213,17 @@ MIN_TEXT_CHARS_FOR_TEXT_PDF = 30
 MAX_CELL_CHARS = 49500
 TRUNCATION_SUFFIX = " ...[TRUNCATED -- exceeded Google Sheets 50,000 char cell limit]"
 
+
 def truncate_for_sheet_cell(text: str) -> str:
     if len(text) <= MAX_CELL_CHARS:
         return text
     cutoff = MAX_CELL_CHARS - len(TRUNCATION_SUFFIX)
     return text[:cutoff] + TRUNCATION_SUFFIX
 
+
 def is_unsupported_xfa_placeholder(text: str) -> bool:
     return PLACEHOLDER_SIGNATURE.lower() in text.lower()
+
 
 def is_scanned_photo_pdf(text: str) -> bool:
     non_whitespace_chars = len(re.sub(r"\s+", "", text))
@@ -232,7 +234,7 @@ def is_scanned_photo_pdf(text: str) -> bool:
 
 OCR_DPI = 300
 OCR_LANGUAGE = "eng"
-# pytesseract.pytesseract.tesseract_cmd = "/opt/homebrew/bin/tesseract"
+
 
 def ocr_pdf_bytes(pdf_bytes: bytes) -> str:
     text_parts = []
@@ -281,10 +283,7 @@ def extract_main_objects(text: str) -> str:
         if idx == -1:
             idx = norm.lower().find("object")
         if idx != -1:
-            print(f"    [debug] Nearby text: ...{norm[max(0, idx-30):idx+200]}...")
-        else:
-            print(f"    [debug] 'object' not found anywhere in extracted text "
-                  f"({len(norm)} chars total). PDF text extraction may have failed.")
+            pass
         return ""
     return re.sub(r"\s+", " ", match.group(1)).strip()
 
@@ -299,7 +298,7 @@ def build_extraction_result(raw_text: str) -> tuple:
 
 
 def extract_doc_text_parallel(context, cookies: dict, browser_lock: threading.Lock,
-                               doc_url: str, prefetched_bytes: bytes = None) -> tuple:
+                              doc_url: str, prefetched_bytes: bytes = None) -> tuple:
     if prefetched_bytes is not None:
         pdf_bytes = prefetched_bytes
     else:
@@ -320,7 +319,6 @@ def extract_doc_text_parallel(context, cookies: dict, browser_lock: threading.Lo
         try:
             ocr_text = ocr_pdf_bytes(pdf_bytes)
         except Exception as e:
-            print(f"  OCR failed: {e}")
             return "Photo pdf", STATUS_NONE
 
         if is_scanned_photo_pdf(ocr_text):
@@ -335,31 +333,19 @@ def prefetch_direct_downloads(links, cookies: dict) -> dict:
     results = {}
     if not links:
         return results
-
-    print(f"  Prefetching {len(links)} unique document(s) via direct download "
-          f"({PREFETCH_WORKERS} parallel workers)...")
-
     with ThreadPoolExecutor(max_workers=PREFETCH_WORKERS) as executor:
         future_to_link = {
             executor.submit(try_direct_download, link, cookies): link
             for link in links
         }
-        done = 0
         for future in as_completed(future_to_link):
             link = future_to_link[future]
-            done += 1
             try:
                 pdf_file = future.result()
             except Exception:
                 pdf_file = None
             if pdf_file is not None:
                 results[link] = pdf_file.getvalue()
-            if done % 25 == 0 or done == len(links):
-                print(f"    Prefetch progress: {done}/{len(links)} "
-                      f"({len(results)} succeeded direct)")
-
-    print(f"  Prefetch done: {len(results)}/{len(links)} downloaded directly; "
-          f"{len(links) - len(results)} will use the Playwright fallback.")
     return results
 
 
@@ -385,18 +371,13 @@ def parse_header(header_row):
     required = [CIN_HEADER, LINK_HEADER, EXTRACTION_HEADER, STATUS_HEADER]
     missing = [h for h in required if h not in indices]
     if missing:
-        raise ValueError(f"Could not find column(s) {missing} in header row: {header_row}. "
-                          f"Make sure the sheet has an '{STATUS_HEADER}' column (col F) "
-                          f"in addition to '{EXTRACTION_HEADER}' (col E).")
-
+        raise ValueError(f"Could not find column(s) {missing} in header row.")
     return indices
 
 
 def safe_get(row, idx):
     return row[idx].strip() if idx is not None and idx < len(row) and row[idx] else ""
 
-
-# ---------------- COLUMN LETTER HELPER ----------------
 
 def col_num_to_letter(n: int) -> str:
     letters = ""
@@ -406,10 +387,8 @@ def col_num_to_letter(n: int) -> str:
     return letters
 
 
-# ---------------- IN-PLACE COLUMN WRITE ----------------
-
 def write_column_values(input_sheet, batch_start, batch_end, col_idx,
-                         chunk_rows, new_values_by_row, label):
+                        chunk_rows, new_values_by_row, label):
     col_letter = col_num_to_letter(col_idx + 1)
     values = []
     for offset, sheet_row in enumerate(range(batch_start, batch_end + 1)):
@@ -444,10 +423,7 @@ def process_sheet():
     link_idx = indices[LINK_HEADER]
     extraction_idx = indices[EXTRACTION_HEADER]
     status_idx = indices[STATUS_HEADER]
-    print(f"Header parsed: CIN col {cin_idx}, Link col {link_idx}, "
-          f"extraction col {extraction_idx}, extraction_status col {status_idx}")
 
-    # FIX: Parse cookies directly from the TRACXN_SESSION_DATA dictionary
     cookies = {c["name"]: c["value"] for c in TRACXN_SESSION_DATA.get("cookies", [])}
 
     last_col_needed = max(indices.values())
@@ -456,9 +432,11 @@ def process_sheet():
 
     extracted_result_cache = {}
 
+    # Track CINs that have successfully extracted clause 3a across all batches
+    successful_cins = set()
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        # FIX: Pass the dictionary directly as storage_state
         context = browser.new_context(storage_state=TRACXN_SESSION_DATA)
         browser_lock = threading.Lock()
 
@@ -476,12 +454,15 @@ def process_sheet():
             print(f"\n=== Batch: input rows {batch_start}-{batch_end} "
                   f"({len(chunk_rows)} fetched) ===")
 
-            row_infos = []
-            unique_links = set()
-            any_data_in_chunk = False
+            new_extraction_values = {}
+            new_status_values = {}
+            unprocessed_rows_by_cin = {}
+
             skipped_already_processed = 0
             skipped_no_link = 0
+            any_data_in_chunk = False
 
+            # PRE-PROCESS BATCH TO ORGANIZE BY CIN
             for offset, row in enumerate(chunk_rows):
                 sheet_row_number = batch_start + offset
                 cin = safe_get(row, cin_idx)
@@ -490,90 +471,124 @@ def process_sheet():
                 any_data_in_chunk = True
 
                 already_processed = bool(safe_get(row, extraction_idx))
+                status_val = safe_get(row, status_idx)
+
+                # If row was already processed in a previous run and it's successful
                 if already_processed:
+                    if status_val == STATUS_CLAUSE_MATCHED:
+                        successful_cins.add(cin)
                     skipped_already_processed += 1
                     continue
 
                 link = safe_get(row, link_idx)
                 if not link:
                     skipped_no_link += 1
+                    new_extraction_values[sheet_row_number] = "No Link"
+                    new_status_values[sheet_row_number] = "Skipped"
                     continue
 
-                row_infos.append((sheet_row_number, link))
-                unique_links.add(link)
+                # If this CIN had a successful Clause 3a extraction earlier, skip this row entirely
+                if cin in successful_cins:
+                    new_extraction_values[sheet_row_number] = "Skipped"
+                    new_status_values[sheet_row_number] = "Skipped - Same CIN"
+                    continue
+
+                # Add to queue for processing in this batch
+                if cin not in unprocessed_rows_by_cin:
+                    unprocessed_rows_by_cin[cin] = []
+                unprocessed_rows_by_cin[cin].append((sheet_row_number, link))
 
             if not any_data_in_chunk:
                 print("  No CIN values found in this batch -- stopping.")
                 break
 
             if skipped_already_processed:
-                print(f"  Skipping {skipped_already_processed} row(s) that already "
-                      f"have an '{EXTRACTION_HEADER}' value (already processed).")
-            if skipped_no_link:
-                print(f"  Skipping {skipped_no_link} row(s) with no Link value.")
+                print(f"  Skipping {skipped_already_processed} row(s) that already have an extraction value.")
 
-            if not row_infos:
-                print("  Nothing new to process in this batch.")
-                current_row = batch_end + 1
-                continue
+            # PROCESS QUEUE IN "ROUNDS"
+            # Round 1 extracts the latest link for every CIN. Round 2 tries the next oldest if Round 1 fails, etc.
+            round_num = 1
+            while unprocessed_rows_by_cin:
+                print(f"  Round {round_num}: processing {len(unprocessed_rows_by_cin)} unique CIN(s)...")
+                round_links = set()
+                round_row_infos = []
 
-            print(f"  {len(row_infos)} document rows in this batch; "
-                  f"{len(unique_links)} unique documents to extract.")
+                for cin, rows in unprocessed_rows_by_cin.items():
+                    # Pick the first (latest) document for the CIN
+                    sheet_row_number, link = rows[0]
+                    round_links.add(link)
+                    round_row_infos.append((cin, sheet_row_number, link))
 
-            prefetch_cache = prefetch_direct_downloads(unique_links, cookies)
+                prefetch_cache = prefetch_direct_downloads(round_links, cookies)
+                docs_to_extract = [link for link in round_links if link not in extracted_result_cache]
 
-            docs_to_extract = sorted(
-                link for link in unique_links if link not in extracted_result_cache
-            )
-            print(f"  Extracting {len(docs_to_extract)} not-yet-cached document(s) "
-                  f"with up to {EXTRACTION_WORKERS} parallel workers...")
+                # Parallel execution for the current round
+                if docs_to_extract:
+                    with ThreadPoolExecutor(max_workers=EXTRACTION_WORKERS) as executor:
+                        future_to_link = {
+                            executor.submit(
+                                extract_doc_text_parallel,
+                                context, cookies, browser_lock, link, prefetch_cache.get(link)
+                            ): link
+                            for link in docs_to_extract
+                        }
+                        for future in as_completed(future_to_link):
+                            link = future_to_link[future]
+                            try:
+                                extract_text, status_value = future.result()
+                            except Exception as e:
+                                extract_text, status_value = "Content not available", STATUS_NONE
+                                print(f"  Error extracting doc: {e}")
+                            extracted_result_cache[link] = (extract_text, status_value)
 
-            if docs_to_extract:
-                with ThreadPoolExecutor(max_workers=EXTRACTION_WORKERS) as executor:
-                    future_to_link = {
-                        executor.submit(
-                            extract_doc_text_parallel,
-                            context, cookies, browser_lock, link,
-                            prefetch_cache.get(link),
-                        ): link
-                        for link in docs_to_extract
-                    }
-                    done = 0
-                    for future in as_completed(future_to_link):
-                        link = future_to_link[future]
-                        try:
-                            extract_text, status_value = future.result()
-                        except Exception as e:
-                            extract_text, status_value = "Content not available", STATUS_NONE
-                            print(f"  Error extracting doc (PDF/Playwright failure): {e}")
-                        extracted_result_cache[link] = (extract_text, status_value)
-                        done += 1
-                        if done % 10 == 0 or done == len(docs_to_extract):
-                            print(f"    Extraction progress: {done}/{len(docs_to_extract)}")
+                # Evaluate results
+                cins_to_remove = []
+                for cin, sheet_row_number, link in round_row_infos:
+                    extract_text, status_value = extracted_result_cache.get(
+                        link, ("Content not available", STATUS_NONE)
+                    )
 
-            new_extraction_values = {}
-            new_status_values = {}
-            for sheet_row_number, link in row_infos:
-                extract_text, status_value = extracted_result_cache.get(
-                    link, ("Content not available", STATUS_NONE)
+                    new_extraction_values[sheet_row_number] = truncate_for_sheet_cell(extract_text)
+                    new_status_values[sheet_row_number] = status_value
+
+                    # If successful, skip older documents for this CIN
+                    if status_value == STATUS_CLAUSE_MATCHED:
+                        successful_cins.add(cin)
+                        cins_to_remove.append(cin)
+                        # Mark all remaining rows for this CIN as skipped
+                        for rem_row, rem_link in unprocessed_rows_by_cin[cin][1:]:
+                            new_extraction_values[rem_row] = "Skipped"
+                            new_status_values[rem_row] = "Skipped - Same CIN"
+                    else:
+                        # Failed to get clause 3a. Remove the current link and let the loop try the next one in the next round.
+                        unprocessed_rows_by_cin[cin].pop(0)
+                        if not unprocessed_rows_by_cin[cin]:
+                            cins_to_remove.append(cin)
+
+                # Clean up CINs that are either successfully matched or have no more links to try
+                for cin in set(cins_to_remove):
+                    if cin in unprocessed_rows_by_cin:
+                        del unprocessed_rows_by_cin[cin]
+
+                round_num += 1
+
+            # WRITE RESULTS TO SPREADSHEET
+            if new_extraction_values:
+                write_column_values(
+                    input_sheet, batch_start, batch_end, extraction_idx,
+                    chunk_rows, new_extraction_values, EXTRACTION_HEADER,
                 )
-                new_extraction_values[sheet_row_number] = truncate_for_sheet_cell(extract_text)
-                new_status_values[sheet_row_number] = status_value
-
-            write_column_values(
-                input_sheet, batch_start, batch_end, extraction_idx,
-                chunk_rows, new_extraction_values, EXTRACTION_HEADER,
-            )
-            write_column_values(
-                input_sheet, batch_start, batch_end, status_idx,
-                chunk_rows, new_status_values, STATUS_HEADER,
-            )
+                write_column_values(
+                    input_sheet, batch_start, batch_end, status_idx,
+                    chunk_rows, new_status_values, STATUS_HEADER,
+                )
 
             current_row = batch_end + 1
 
         browser.close()
 
     print("\nDone.")
+
 
 if __name__ == "__main__":
     process_sheet()
