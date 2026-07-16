@@ -6,7 +6,6 @@ import time
 import string
 import threading
 import requests
-import gc
 import PyPDF2
 import gspread
 
@@ -62,9 +61,9 @@ STATUS_CLAUSE_MATCHED = "clause 3a"
 STATUS_FULL_EXTRACT = "Full Extract"
 STATUS_NONE = ""
 
-PREFETCH_WORKERS = 4
-INPUT_BATCH_SIZE = 25
-EXTRACTION_WORKERS = 5
+PREFETCH_WORKERS = 8
+INPUT_BATCH_SIZE = 100
+EXTRACTION_WORKERS = 25
 
 # Retry settings
 SHEETS_MAX_RETRIES = 5
@@ -231,7 +230,7 @@ def is_scanned_photo_pdf(text: str) -> bool:
 
 # ---------------- OCR FALLBACK ----------------
 
-OCR_DPI = 200
+OCR_DPI = 300
 OCR_LANGUAGE = "eng"
 # pytesseract.pytesseract.tesseract_cmd = "/opt/homebrew/bin/tesseract"
 
@@ -246,9 +245,6 @@ def ocr_pdf_bytes(pdf_bytes: bytes) -> str:
             img = Image.open(io.BytesIO(pix.tobytes("png")))
             page_text = pytesseract.image_to_string(img, lang=OCR_LANGUAGE)
             text_parts.append(page_text)
-            img.close()
-            del img
-            del pix
     finally:
         doc.close()
     return "\n".join(text_parts)
@@ -518,11 +514,7 @@ def process_sheet():
 
             if not row_infos:
                 print("  Nothing new to process in this batch.")
-                prefetch_cache.clear()
-            extracted_result_cache.clear()
-            gc.collect()
-
-            current_row = batch_end + 1
+                current_row = batch_end + 1
                 continue
 
             print(f"  {len(row_infos)} document rows in this batch; "
@@ -576,10 +568,6 @@ def process_sheet():
                 input_sheet, batch_start, batch_end, status_idx,
                 chunk_rows, new_status_values, STATUS_HEADER,
             )
-
-            prefetch_cache.clear()
-            extracted_result_cache.clear()
-            gc.collect()
 
             current_row = batch_end + 1
 
