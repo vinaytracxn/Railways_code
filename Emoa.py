@@ -10,26 +10,27 @@ import PyPDF2
 import gspread
 
 try:
-    # PyMuPDF's newer canonical import name
     import pymupdf as fitz
 except ImportError:
-    import fitz  # PyMuPDF
-
+    import fitz
 import pytesseract
 from PIL import Image
 
-# Disable the safety cap for high DPI PDF rasterization
 Image.MAX_IMAGE_PIXELS = None
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from playwright.sync_api import sync_playwright
 from google.oauth2.service_account import Credentials
 
-# ---------------- CONFIG ----------------
+# ---------------- CONFIG / ENV ----------------
+# Load authentication and session data from environment variables
 GOOGLE_SERVICE_ACCOUNT_INFO = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
 TRACXN_SESSION_DATA = json.loads(os.environ["TRACXN_SESSION_JSON"])
 
 INPUT_SPREADSHEET_ID = os.environ["SHEET_ID"]
-INPUT_SHEET_NAME = "Sheet1"
+INPUT_SHEET_NAME = "Altered MOA"
+
+# Read the start row from env, default to 2 (first data row) if not provided
+START_ROW = int(os.environ.get("START_ROW", "2"))
 
 START_MARKERS = [
     "MEMORANDUM OF ASSOCIATION OF A COMPANY LIMITED BY SHARES"
@@ -48,7 +49,6 @@ END_MARKERS = [
     "Objects, ancillary or",
 ]
 
-# Column header names
 CIN_HEADER = "CIN"
 DISPLAY_NAME_HEADER = "Display Name"
 DATE_HEADER = "Date"
@@ -56,16 +56,15 @@ LINK_HEADER = "Link"
 EXTRACTION_HEADER = "extraction"
 STATUS_HEADER = "extraction_status"
 
-# Status labels
 STATUS_CLAUSE_MATCHED = "clause 3a"
 STATUS_FULL_EXTRACT = "Full Extract"
 STATUS_NONE = ""
+STATUS_SKIPPED = "Skipped - Same CIN"
 
 PREFETCH_WORKERS = 8
-INPUT_BATCH_SIZE = 40
-EXTRACTION_WORKERS = 5
+INPUT_BATCH_SIZE = 100
+EXTRACTION_WORKERS = 25
 
-# Retry settings
 SHEETS_MAX_RETRIES = 5
 SHEETS_RETRY_BASE_DELAY = 5
 # -----------------------------------------
@@ -108,6 +107,10 @@ def gspread_auth():
     return gspread.authorize(creds)
 
 
+def load_cookies_from_session_data(state: dict) -> dict:
+    return {c["name"]: c["value"] for c in state.get("cookies", [])}
+
+
 # ---------------- PDF FETCHING ----------------
 
 def try_direct_download(url: str, cookies: dict):
@@ -146,15 +149,13 @@ def fetch_pdf_via_direct_download(context, doc_url: str) -> io.BytesIO:
                 page.goto(doc_url, timeout=60000)
             except Exception:
                 pass
-        download = download_info.value
-        download_path = download.path()
+        download_path = download_info.value.path()
         with open(download_path, "rb") as f:
             content = f.read()
     finally:
         page.close()
 
     if not content.startswith(b"%PDF"):
-        print("  WARNING: Downloaded content does not look like a PDF.")
         raise Exception("Downloaded content is not a valid PDF")
 
     return io.BytesIO(content)
@@ -167,8 +168,7 @@ def fetch_pdf_via_page(context, doc_url: str) -> io.BytesIO:
     captured = {}
 
     def handle_response(response):
-        if "data" in captured:
-            return
+        if "data" in captured: return
         if looks_like_pdf_response(response):
             try:
                 body = response.body()
@@ -189,7 +189,6 @@ def fetch_pdf_via_page(context, doc_url: str) -> io.BytesIO:
     if "data" not in captured:
         raise Exception("No PDF response was captured while loading the document page")
 
-    print(f"  Captured PDF from: {captured['url']}")
     return io.BytesIO(captured["data"])
 
 
@@ -199,10 +198,8 @@ def fetch_pdf(context, cookies: dict, doc_url: str, prefetched_bytes: bytes = No
 
     pdf_file = try_direct_download(doc_url, cookies)
     if pdf_file is not None:
-        print("  Downloaded directly via requests (no browser needed)")
         return pdf_file
 
-    print("  Direct download didn't return a PDF -- falling back to Playwright...")
     return fetch_pdf_via_page(context, doc_url)
 
 
@@ -278,12 +275,6 @@ def extract_main_objects(text: str) -> str:
     )
     match = pattern.search(text)
     if not match:
-        norm = re.sub(r"\s+", " ", text)
-        idx = norm.lower().find("objects to be pursued")
-        if idx == -1:
-            idx = norm.lower().find("object")
-        if idx != -1:
-            pass
         return ""
     return re.sub(r"\s+", " ", match.group(1)).strip()
 
@@ -323,7 +314,6 @@ def extract_doc_text_parallel(context, cookies: dict, browser_lock: threading.Lo
 
         if is_scanned_photo_pdf(ocr_text):
             return "Photo pdf", STATUS_NONE
-
         return build_extraction_result(ocr_text)
 
     return build_extraction_result(pdf_text)
@@ -331,8 +321,8 @@ def extract_doc_text_parallel(context, cookies: dict, browser_lock: threading.Lo
 
 def prefetch_direct_downloads(links, cookies: dict) -> dict:
     results = {}
-    if not links:
-        return results
+    if not links: return results
+
     with ThreadPoolExecutor(max_workers=PREFETCH_WORKERS) as executor:
         future_to_link = {
             executor.submit(try_direct_download, link, cookies): link
@@ -349,7 +339,7 @@ def prefetch_direct_downloads(links, cookies: dict) -> dict:
     return results
 
 
-# ---------------- HEADER PARSING ----------------
+# ---------------- UTILS ----------------
 
 def parse_header(header_row):
     indices = {}
@@ -403,8 +393,7 @@ def write_column_values(input_sheet, batch_start, batch_end, col_idx,
         input_sheet.update,
         range_name=range_name, values=values, value_input_option="RAW",
     )
-    print(f"  --> Wrote {len(new_values_by_row)} {label} result(s) to column "
-          f"{col_letter} ({batch_start}-{batch_end})")
+    print(f"  --> Wrote {len(new_values_by_row)} {label} result(s) to column {col_letter} ({batch_start}-{batch_end})")
 
 
 # ---------------- MAIN ----------------
@@ -424,23 +413,33 @@ def process_sheet():
     extraction_idx = indices[EXTRACTION_HEADER]
     status_idx = indices[STATUS_HEADER]
 
-    cookies = {c["name"]: c["value"] for c in TRACXN_SESSION_DATA.get("cookies", [])}
-
-    last_col_needed = max(indices.values())
-    last_col_letter = col_num_to_letter(last_col_needed + 1)
+    cookies = load_cookies_from_session_data(TRACXN_SESSION_DATA)
+    last_col_letter = col_num_to_letter(max(indices.values()) + 1)
     total_rows_in_sheet = input_sheet.row_count
 
-    extracted_result_cache = {}
-
-    # Track CINs that have successfully extracted clause 3a across all batches
+    # Pre-scan the sheet to build a set of CINs that ALREADY have clause 3a
     successful_cins = set()
+    print("Pre-scanning sheet to map already successful CINs...")
+    try:
+        all_cins = call_with_retry(input_sheet.col_values, cin_idx + 1)
+        all_statuses = call_with_retry(input_sheet.col_values, status_idx + 1)
+        for c, s in zip(all_cins[1:], all_statuses[1:]):  # skip header
+            if s.strip() == STATUS_CLAUSE_MATCHED:
+                successful_cins.add(c.strip())
+        print(f"Found {len(successful_cins)} CINs that already have '{STATUS_CLAUSE_MATCHED}'.")
+    except Exception as e:
+        print(f"Warning: Initial status pre-scan failed ({e}). Proceeding without seeding memory.")
+
+    extracted_result_cache = {}
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(storage_state=TRACXN_SESSION_DATA)
         browser_lock = threading.Lock()
 
-        current_row = 2
+        current_row = START_ROW
+        print(f"\n--- Starting processing from row {START_ROW} ---")
+
         while current_row <= total_rows_in_sheet:
             batch_start = current_row
             batch_end = min(current_row + INPUT_BATCH_SIZE - 1, total_rows_in_sheet)
@@ -451,18 +450,15 @@ def process_sheet():
             if not chunk_rows:
                 break
 
-            print(f"\n=== Batch: input rows {batch_start}-{batch_end} "
-                  f"({len(chunk_rows)} fetched) ===")
+            print(f"\n=== Batch: input rows {batch_start}-{batch_end} ({len(chunk_rows)} fetched) ===")
 
-            new_extraction_values = {}
-            new_status_values = {}
-            unprocessed_rows_by_cin = {}
-
+            row_infos = []  # (sheet_row_number, cin, link)
+            rows_to_skip = []  # (sheet_row_number, cin) -> to be written as "Skipped"
+            unique_links = set()
+            any_data_in_chunk = False
             skipped_already_processed = 0
             skipped_no_link = 0
-            any_data_in_chunk = False
 
-            # PRE-PROCESS BATCH TO ORGANIZE BY CIN
             for offset, row in enumerate(chunk_rows):
                 sheet_row_number = batch_start + offset
                 cin = safe_get(row, cin_idx)
@@ -470,65 +466,63 @@ def process_sheet():
                     continue
                 any_data_in_chunk = True
 
-                already_processed = bool(safe_get(row, extraction_idx))
                 status_val = safe_get(row, status_idx)
+                extracted_val = safe_get(row, extraction_idx)
 
-                # If row was already processed in a previous run and it's successful
-                if already_processed:
-                    if status_val == STATUS_CLAUSE_MATCHED:
-                        successful_cins.add(cin)
+                # If this row is the one that succeeded, add its CIN to our skip list
+                if status_val == STATUS_CLAUSE_MATCHED:
+                    successful_cins.add(cin)
+                    skipped_already_processed += 1
+                    continue
+
+                # If we already have a success for this CIN, skip this row entirely
+                if cin in successful_cins:
+                    if extracted_val != "Skipped":
+                        rows_to_skip.append((sheet_row_number, cin))
+                    else:
+                        skipped_already_processed += 1
+                    continue
+
+                if bool(extracted_val):
                     skipped_already_processed += 1
                     continue
 
                 link = safe_get(row, link_idx)
                 if not link:
                     skipped_no_link += 1
-                    new_extraction_values[sheet_row_number] = "No Link"
-                    new_status_values[sheet_row_number] = "Skipped"
                     continue
 
-                # If this CIN had a successful Clause 3a extraction earlier, skip this row entirely
-                if cin in successful_cins:
-                    new_extraction_values[sheet_row_number] = "Skipped"
-                    new_status_values[sheet_row_number] = "Skipped - Same CIN"
-                    continue
-
-                # Add to queue for processing in this batch
-                if cin not in unprocessed_rows_by_cin:
-                    unprocessed_rows_by_cin[cin] = []
-                unprocessed_rows_by_cin[cin].append((sheet_row_number, link))
+                row_infos.append((sheet_row_number, cin, link))
+                unique_links.add(link)
 
             if not any_data_in_chunk:
                 print("  No CIN values found in this batch -- stopping.")
                 break
 
             if skipped_already_processed:
-                print(f"  Skipping {skipped_already_processed} row(s) that already have an extraction value.")
+                print(f"  Skipping {skipped_already_processed} row(s) already processed.")
+            if rows_to_skip:
+                print(f"  Skipping {len(rows_to_skip)} row(s) because their CIN already has clause 3a.")
+            if skipped_no_link:
+                print(f"  Skipping {skipped_no_link} row(s) with no Link value.")
 
-            # PROCESS QUEUE IN "ROUNDS"
-            # Round 1 extracts the latest link for every CIN. Round 2 tries the next oldest if Round 1 fails, etc.
-            round_num = 1
-            while unprocessed_rows_by_cin:
-                print(f"  Round {round_num}: processing {len(unprocessed_rows_by_cin)} unique CIN(s)...")
-                round_links = set()
-                round_row_infos = []
+            if not row_infos and not rows_to_skip:
+                print("  Nothing new to process or mark in this batch.")
+                current_row = batch_end + 1
+                continue
 
-                for cin, rows in unprocessed_rows_by_cin.items():
-                    # Pick the first (latest) document for the CIN
-                    sheet_row_number, link = rows[0]
-                    round_links.add(link)
-                    round_row_infos.append((cin, sheet_row_number, link))
+            # PREFETCH & EXTRACT
+            if unique_links:
+                prefetch_cache = prefetch_direct_downloads(unique_links, cookies)
+                docs_to_extract = sorted(link for link in unique_links if link not in extracted_result_cache)
 
-                prefetch_cache = prefetch_direct_downloads(round_links, cookies)
-                docs_to_extract = [link for link in round_links if link not in extracted_result_cache]
-
-                # Parallel execution for the current round
                 if docs_to_extract:
                     with ThreadPoolExecutor(max_workers=EXTRACTION_WORKERS) as executor:
                         future_to_link = {
                             executor.submit(
                                 extract_doc_text_parallel,
-                                context, cookies, browser_lock, link, prefetch_cache.get(link)
+                                context, cookies, browser_lock, link,
+                                prefetch_cache.get(link),
                             ): link
                             for link in docs_to_extract
                         }
@@ -538,50 +532,43 @@ def process_sheet():
                                 extract_text, status_value = future.result()
                             except Exception as e:
                                 extract_text, status_value = "Content not available", STATUS_NONE
-                                print(f"  Error extracting doc: {e}")
                             extracted_result_cache[link] = (extract_text, status_value)
 
-                # Evaluate results
-                cins_to_remove = []
-                for cin, sheet_row_number, link in round_row_infos:
-                    extract_text, status_value = extracted_result_cache.get(
-                        link, ("Content not available", STATUS_NONE)
-                    )
+            # ASSEMBLE NEW VALUES
+            new_extraction_values = {}
+            new_status_values = {}
 
-                    new_extraction_values[sheet_row_number] = truncate_for_sheet_cell(extract_text)
-                    new_status_values[sheet_row_number] = status_value
+            # Apply skip logic for CINs that were successful before this batch started
+            for sheet_row_number, cin in rows_to_skip:
+                new_extraction_values[sheet_row_number] = "Skipped"
+                new_status_values[sheet_row_number] = STATUS_SKIPPED
 
-                    # If successful, skip older documents for this CIN
-                    if status_value == STATUS_CLAUSE_MATCHED:
-                        successful_cins.add(cin)
-                        cins_to_remove.append(cin)
-                        # Mark all remaining rows for this CIN as skipped
-                        for rem_row, rem_link in unprocessed_rows_by_cin[cin][1:]:
-                            new_extraction_values[rem_row] = "Skipped"
-                            new_status_values[rem_row] = "Skipped - Same CIN"
-                    else:
-                        # Failed to get clause 3a. Remove the current link and let the loop try the next one in the next round.
-                        unprocessed_rows_by_cin[cin].pop(0)
-                        if not unprocessed_rows_by_cin[cin]:
-                            cins_to_remove.append(cin)
+            # Apply results and in-batch skip logic
+            for sheet_row_number, cin, link in row_infos:
+                # Re-check if this CIN became successful during THIS batch's write-back loop
+                if cin in successful_cins:
+                    new_extraction_values[sheet_row_number] = "Skipped"
+                    new_status_values[sheet_row_number] = STATUS_SKIPPED
+                    continue
 
-                # Clean up CINs that are either successfully matched or have no more links to try
-                for cin in set(cins_to_remove):
-                    if cin in unprocessed_rows_by_cin:
-                        del unprocessed_rows_by_cin[cin]
-
-                round_num += 1
-
-            # WRITE RESULTS TO SPREADSHEET
-            if new_extraction_values:
-                write_column_values(
-                    input_sheet, batch_start, batch_end, extraction_idx,
-                    chunk_rows, new_extraction_values, EXTRACTION_HEADER,
+                extract_text, status_value = extracted_result_cache.get(
+                    link, ("Content not available", STATUS_NONE)
                 )
-                write_column_values(
-                    input_sheet, batch_start, batch_end, status_idx,
-                    chunk_rows, new_status_values, STATUS_HEADER,
-                )
+                new_extraction_values[sheet_row_number] = truncate_for_sheet_cell(extract_text)
+                new_status_values[sheet_row_number] = status_value
+
+                # If this row successfully extracted clause 3a, mark CIN to skip remaining docs
+                if status_value == STATUS_CLAUSE_MATCHED:
+                    successful_cins.add(cin)
+
+            write_column_values(
+                input_sheet, batch_start, batch_end, extraction_idx,
+                chunk_rows, new_extraction_values, EXTRACTION_HEADER,
+            )
+            write_column_values(
+                input_sheet, batch_start, batch_end, status_idx,
+                chunk_rows, new_status_values, STATUS_HEADER,
+            )
 
             current_row = batch_end + 1
 
