@@ -59,33 +59,48 @@ def flush(ws, updates):
         updates.clear()
 
 
-# Updated signature to accept sheet_name
 def process_target(gc, master_ws, master_row, sheet_id, sheet_name, session, headers):
-    ws = gc.open_by_key(sheet_id).worksheet(sheet_name)  # Uses dynamic sheet name here
+    ws = gc.open_by_key(sheet_id).worksheet(sheet_name)
     values = ws.get_all_values()
-    start_row = 2
+
+    # Read fresh values from master to calculate exact resume point
     mv = master_ws.row_values(master_row)
+
+    start_row = 2
     if len(mv) >= COL_START_ROW:
         v = mv[COL_START_ROW - 1].strip()
         if v.isdigit():
             start_row = max(2, int(v))
+
     processed = 0
+    if len(mv) >= COL_ROWS_PROCESSED:
+        p = mv[COL_ROWS_PROCESSED - 1].strip()
+        if p.isdigit():
+            processed = int(p)
+
+    # Calculate the exact row to resume from
+    resume_row = start_row + processed
+
     updates = []
-    for r in range(start_row, len(values) + 1):
+    for r in range(resume_row, len(values) + 1):
         rec = values[r - 1] + [""] * 20
         le_id = rec[3].strip()
         pa_id = rec[7].strip()
         feed_ids = rec[8].strip()
+
         if not (le_id and pa_id and feed_ids):
             status, reason = "Failed", "Missing LE ID / PA ID / Feed ID"
         else:
             status, reason = update_platform(session, headers, build_payload(le_id, pa_id, feed_ids))
             time.sleep(API_DELAY)
+
         updates.append({"range": f"J{r}:K{r}", "values": [[status, reason]]})
         processed += 1
+
         if len(updates) >= BATCH_SIZE:
             flush(ws, updates)
             master_ws.update_cell(master_row, COL_ROWS_PROCESSED, processed)
+
     flush(ws, updates)
     master_ws.update_cell(master_row, COL_ROWS_PROCESSED, processed)
 
@@ -93,19 +108,22 @@ def process_target(gc, master_ws, master_row, sheet_id, sheet_name, session, hea
 def process_master(gc, session, headers):
     m = gc.open_by_key(MASTER_SPREADSHEET_ID).worksheet(MASTER_SHEET_NAME)
     rows = m.get_all_values()
+
     for mr, row in enumerate(rows[1:], start=2):
         sid = row[COL_SHEET_ID - 1].strip() if len(row) >= COL_SHEET_ID else ""
-
-        # Reads target sheet name from Col C
         sheet_name = row[COL_SHEET_NAME - 1].strip() if len(row) >= COL_SHEET_NAME else ""
+        status = row[COL_STATUS - 1].strip() if len(row) >= COL_STATUS else ""
 
-        # Skips if either sheet ID or sheet name is missing
+        # Skip if missing required data
         if not sid or not sheet_name:
+            continue
+
+        # Skip if already completed
+        if status.lower() == "completed":
             continue
 
         m.update_cell(mr, COL_STATUS, "Processing")
         try:
-            # Passes sheet_name to the child function
             process_target(gc, m, mr, sid, sheet_name, session, headers)
             m.update_cell(mr, COL_STATUS, "Completed")
         except Exception as e:
