@@ -1,4 +1,3 @@
-# Refactored LeUpdate.py
 import os, json, time, requests, gspread
 from google.oauth2.service_account import Credentials
 
@@ -10,14 +9,19 @@ BATCH_SIZE=100
 API_DELAY=0.4
 REQUEST_TIMEOUT=30
 
+COL_SHEET_ID=2
+COL_SHEET_NAME=3
+COL_ROWS_PROCESSED=4
+COL_START_ROW=5
+COL_STATUS=6
+
 def gspread_auth():
     creds=Credentials.from_service_account_info(
         json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]),
         scopes=[
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive"
-        ]
-    )
+        ])
     return gspread.authorize(creds)
 
 def create_session():
@@ -55,13 +59,17 @@ def process_target(gc,master_ws,master_row,sheet_id,session,headers):
     values=ws.get_all_values()
     start_row=2
     mv=master_ws.row_values(master_row)
-    if len(mv)>=4 and mv[3].isdigit():
-        start_row=max(2,int(mv[3]))
+    if len(mv)>=COL_START_ROW:
+        v=mv[COL_START_ROW-1].strip()
+        if v.isdigit():
+            start_row=max(2,int(v))
     processed=0
     updates=[]
     for r in range(start_row,len(values)+1):
         rec=values[r-1]+[""]*20
-        le_id=rec[3].strip(); pa_id=rec[7].strip(); feed_ids=rec[8].strip()
+        le_id=rec[3].strip()
+        pa_id=rec[7].strip()
+        feed_ids=rec[8].strip()
         if not(le_id and pa_id and feed_ids):
             status,reason="Failed","Missing LE ID / PA ID / Feed ID"
         else:
@@ -71,22 +79,23 @@ def process_target(gc,master_ws,master_row,sheet_id,session,headers):
         processed+=1
         if len(updates)>=BATCH_SIZE:
             flush(ws,updates)
-            master_ws.update_cell(master_row,3,processed)
+            master_ws.update_cell(master_row,COL_ROWS_PROCESSED,processed)
     flush(ws,updates)
-    master_ws.update_cell(master_row,3,processed)
+    master_ws.update_cell(master_row,COL_ROWS_PROCESSED,processed)
 
 def process_master(gc,session,headers):
     m=gc.open_by_key(MASTER_SPREADSHEET_ID).worksheet(MASTER_SHEET_NAME)
     rows=m.get_all_values()
     for mr,row in enumerate(rows[1:],start=2):
-        sid=row[1].strip() if len(row)>1 else ""
-        if not sid: continue
-        m.update_cell(mr,5,"Processing")
+        sid=row[COL_SHEET_ID-1].strip() if len(row)>=COL_SHEET_ID else ""
+        if not sid:
+            continue
+        m.update_cell(mr,COL_STATUS,"Processing")
         try:
             process_target(gc,m,mr,sid,session,headers)
-            m.update_cell(mr,5,"Completed")
+            m.update_cell(mr,COL_STATUS,"Completed")
         except Exception as e:
-            m.update_cell(mr,5,"Failed")
+            m.update_cell(mr,COL_STATUS,"Failed")
             print(sid,e)
 
 def main():
