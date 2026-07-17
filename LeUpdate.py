@@ -2,7 +2,7 @@ import os, json, time, requests, gspread
 from google.oauth2.service_account import Credentials
 
 MASTER_SPREADSHEET_ID = "1vPl31_edSUGUwByK9Jn-w2htBGO8njQs2qxNhsYEUsY"
-MASTER_SHEET_NAME = "Master List"
+MASTER_SHEET_NAME = os.environ["MASTER_SHEET"]
 API_URL = "https://platform.tracxn.com/data/entities/3.0/w/legal-entity"
 BATCH_SIZE = 100
 API_DELAY = 0.4
