@@ -71,7 +71,7 @@ CONFIG = {
 
     "DRIVE_FOLDER_ID": os.environ.get("DRIVE_FOLDER_ID", "15KsJ1a51I4n6132IIK-qCGJSVoaBCU0g"),
 
-    "SERVICE_ACCOUNT_FILE": "service_account.json",
+    "SERVICE_ACCOUNT_FILE": json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
 
     "SLEEP_BETWEEN_BATCHES": 0.25,  # seconds
 
