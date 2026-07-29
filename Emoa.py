@@ -30,7 +30,7 @@ from google.oauth2.service_account import Credentials
 GOOGLE_SERVICE_ACCOUNT_INFO = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
 
 INPUT_SPREADSHEET_ID = os.environ["SHEET_ID"]
-INPUT_SHEET_NAME = "Sheet1"
+INPUT_SHEET_NAME = os.environ["SHEET_NAME"]
 
 # Read the start row from env, default to 2 (first data row) if not provided
 START_ROW = int(os.environ.get("START_ROW", "2"))
