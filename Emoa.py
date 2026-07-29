@@ -28,9 +28,10 @@ from google.oauth2.service_account import Credentials
 # ---------------- CONFIG / ENV ----------------
 # Load authentication and session data from environment variables
 GOOGLE_SERVICE_ACCOUNT_INFO = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
+TRACXN_SESSION_DATA = json.loads(os.environ["TRACXN_SESSION_JSON"])
 
 INPUT_SPREADSHEET_ID = os.environ["SHEET_ID"]
-INPUT_SHEET_NAME = os.environ["SHEET_NAME"]
+INPUT_SHEET_NAME = "Sheet1"
 
 # Read the start row from env, default to 2 (first data row) if not provided
 START_ROW = int(os.environ.get("START_ROW", "2"))
@@ -103,7 +104,7 @@ def call_with_retry(func, *args, **kwargs):
     raise last_exc
 
 
-# ---------------- AUTH ----------------
+# ---------------- AUTH / SESSION ----------------
 
 def gspread_auth():
     scope = [
@@ -114,12 +115,17 @@ def gspread_auth():
     return gspread.authorize(creds)
 
 
+def load_cookies_from_session_data(state: dict) -> dict:
+    return {c["name"]: c["value"] for c in state.get("cookies", [])}
+
+
 # ---------------- PDF FETCHING ----------------
 
-def try_direct_download(url: str):
+def try_direct_download(url: str, cookies: dict):
     try:
         response = requests.get(
             url,
+            cookies=cookies,
             headers={"User-Agent": USER_AGENT},
             timeout=30,
             allow_redirects=True,
@@ -194,11 +200,11 @@ def fetch_pdf_via_page(context, doc_url: str) -> io.BytesIO:
     return io.BytesIO(captured["data"])
 
 
-def fetch_pdf(context, doc_url: str, prefetched_bytes: bytes = None) -> io.BytesIO:
+def fetch_pdf(context, cookies: dict, doc_url: str, prefetched_bytes: bytes = None) -> io.BytesIO:
     if prefetched_bytes is not None:
         return io.BytesIO(prefetched_bytes)
 
-    pdf_file = try_direct_download(doc_url)
+    pdf_file = try_direct_download(doc_url, cookies)
     if pdf_file is not None:
         return pdf_file
 
@@ -299,12 +305,12 @@ def build_extraction_result(raw_text: str) -> tuple:
     return full_text, STATUS_FULL_EXTRACT
 
 
-def extract_doc_text_parallel(context, browser_lock: threading.Lock,
+def extract_doc_text_parallel(context, cookies: dict, browser_lock: threading.Lock,
                               doc_url: str, prefetched_bytes: bytes = None) -> tuple:
     if prefetched_bytes is not None:
         pdf_bytes = prefetched_bytes
     else:
-        pdf_file = try_direct_download(doc_url)
+        pdf_file = try_direct_download(doc_url, cookies)
         if pdf_file is not None:
             pdf_bytes = pdf_file.getvalue()
         else:
@@ -330,13 +336,13 @@ def extract_doc_text_parallel(context, browser_lock: threading.Lock,
     return build_extraction_result(pdf_text)
 
 
-def prefetch_direct_downloads(links) -> dict:
+def prefetch_direct_downloads(links, cookies: dict) -> dict:
     results = {}
     if not links: return results
 
     with ThreadPoolExecutor(max_workers=PREFETCH_WORKERS) as executor:
         future_to_link = {
-            executor.submit(try_direct_download, link): link
+            executor.submit(try_direct_download, link, cookies): link
             for link in links
         }
         for future in as_completed(future_to_link):
@@ -424,6 +430,7 @@ def process_sheet():
     extraction_idx = indices[EXTRACTION_HEADER]
     status_idx = indices[STATUS_HEADER]
 
+    cookies = load_cookies_from_session_data(TRACXN_SESSION_DATA)
     last_col_letter = col_num_to_letter(max(indices.values()) + 1)
     total_rows_in_sheet = input_sheet.row_count
 
@@ -458,7 +465,7 @@ def process_sheet():
                 "--js-flags=--max-old-space-size=128",
             ],
         )
-        context = browser.new_context()
+        context = browser.new_context(storage_state=TRACXN_SESSION_DATA)
         browser_lock = threading.Lock()
 
         current_row = START_ROW
@@ -548,7 +555,7 @@ def process_sheet():
 
             # PREFETCH & EXTRACT
             if unique_links:
-                prefetch_cache = prefetch_direct_downloads(unique_links)
+                prefetch_cache = prefetch_direct_downloads(unique_links, cookies)
                 docs_to_extract = sorted(link for link in unique_links if link not in extracted_result_cache)
 
                 if docs_to_extract:
@@ -556,7 +563,7 @@ def process_sheet():
                         future_to_link = {
                             executor.submit(
                                 extract_doc_text_parallel,
-                                context, browser_lock, link,
+                                context, cookies, browser_lock, link,
                                 prefetch_cache.get(link),
                             ): link
                             for link in docs_to_extract
