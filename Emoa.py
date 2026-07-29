@@ -1,6 +1,7 @@
 import os
 import io
 import re
+import gc
 import json
 import time
 import string
@@ -16,7 +17,10 @@ except ImportError:
 import pytesseract
 from PIL import Image
 
-Image.MAX_IMAGE_PIXELS = None
+# Keep decompression-bomb protection ON (removed unlimited override) to avoid
+# unbounded memory allocation on malformed/huge PDF pages.
+Image.MAX_IMAGE_PIXELS = 200_000_000  # ~200MP safety ceiling instead of unlimited
+
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from playwright.sync_api import sync_playwright
 from google.oauth2.service_account import Credentials
@@ -24,7 +28,6 @@ from google.oauth2.service_account import Credentials
 # ---------------- CONFIG / ENV ----------------
 # Load authentication and session data from environment variables
 GOOGLE_SERVICE_ACCOUNT_INFO = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
-TRACXN_SESSION_DATA = json.loads(os.environ["TRACXN_SESSION_JSON"])
 
 INPUT_SPREADSHEET_ID = os.environ["SHEET_ID"]
 INPUT_SHEET_NAME = "Sheet1"
@@ -61,9 +64,13 @@ STATUS_FULL_EXTRACT = "Full Extract"
 STATUS_NONE = ""
 STATUS_SKIPPED = "Skipped - Same CIN"
 
-PREFETCH_WORKERS = 8
-INPUT_BATCH_SIZE = 100
-EXTRACTION_WORKERS = 25
+# ---- MEMORY TUNING ----
+# These were the primary drivers of the 1GB+ RAM usage on Railway.
+# Reduced worker counts (fewer PDFs/images held in memory concurrently)
+# and a smaller batch size (caps how many PDFs get prefetched into RAM at once).
+PREFETCH_WORKERS = 4          # was 8
+EXTRACTION_WORKERS = 6        # was 25  <-- biggest single change
+INPUT_BATCH_SIZE = 40         # was 100
 
 SHEETS_MAX_RETRIES = 5
 SHEETS_RETRY_BASE_DELAY = 5
@@ -96,7 +103,7 @@ def call_with_retry(func, *args, **kwargs):
     raise last_exc
 
 
-# ---------------- AUTH / SESSION ----------------
+# ---------------- AUTH ----------------
 
 def gspread_auth():
     scope = [
@@ -107,17 +114,12 @@ def gspread_auth():
     return gspread.authorize(creds)
 
 
-def load_cookies_from_session_data(state: dict) -> dict:
-    return {c["name"]: c["value"] for c in state.get("cookies", [])}
-
-
 # ---------------- PDF FETCHING ----------------
 
-def try_direct_download(url: str, cookies: dict):
+def try_direct_download(url: str):
     try:
         response = requests.get(
             url,
-            cookies=cookies,
             headers={"User-Agent": USER_AGENT},
             timeout=30,
             allow_redirects=True,
@@ -192,11 +194,11 @@ def fetch_pdf_via_page(context, doc_url: str) -> io.BytesIO:
     return io.BytesIO(captured["data"])
 
 
-def fetch_pdf(context, cookies: dict, doc_url: str, prefetched_bytes: bytes = None) -> io.BytesIO:
+def fetch_pdf(context, doc_url: str, prefetched_bytes: bytes = None) -> io.BytesIO:
     if prefetched_bytes is not None:
         return io.BytesIO(prefetched_bytes)
 
-    pdf_file = try_direct_download(doc_url, cookies)
+    pdf_file = try_direct_download(doc_url)
     if pdf_file is not None:
         return pdf_file
 
@@ -229,7 +231,10 @@ def is_scanned_photo_pdf(text: str) -> bool:
 
 # ---------------- OCR FALLBACK ----------------
 
-OCR_DPI = 300
+# Lowered from 300 -> 200 DPI. Still accurate for OCR on typical scanned
+# legal/registry documents, but produces roughly half the pixel data per
+# page (and therefore roughly half the peak memory per OCR job).
+OCR_DPI = 200
 OCR_LANGUAGE = "eng"
 
 
@@ -240,10 +245,16 @@ def ocr_pdf_bytes(pdf_bytes: bytes) -> str:
         zoom = OCR_DPI / 72
         matrix = fitz.Matrix(zoom, zoom)
         for page in doc:
-            pix = page.get_pixmap(matrix=matrix)
+            # Render directly in grayscale -- Tesseract doesn't need color,
+            # and grayscale pixmaps are ~3x smaller in memory than RGB.
+            pix = page.get_pixmap(matrix=matrix, colorspace=fitz.csGRAY)
             img = Image.open(io.BytesIO(pix.tobytes("png")))
-            page_text = pytesseract.image_to_string(img, lang=OCR_LANGUAGE)
+            try:
+                page_text = pytesseract.image_to_string(img, lang=OCR_LANGUAGE)
+            finally:
+                img.close()
             text_parts.append(page_text)
+            pix = None
     finally:
         doc.close()
     return "\n".join(text_parts)
@@ -288,12 +299,12 @@ def build_extraction_result(raw_text: str) -> tuple:
     return full_text, STATUS_FULL_EXTRACT
 
 
-def extract_doc_text_parallel(context, cookies: dict, browser_lock: threading.Lock,
+def extract_doc_text_parallel(context, browser_lock: threading.Lock,
                               doc_url: str, prefetched_bytes: bytes = None) -> tuple:
     if prefetched_bytes is not None:
         pdf_bytes = prefetched_bytes
     else:
-        pdf_file = try_direct_download(doc_url, cookies)
+        pdf_file = try_direct_download(doc_url)
         if pdf_file is not None:
             pdf_bytes = pdf_file.getvalue()
         else:
@@ -319,13 +330,13 @@ def extract_doc_text_parallel(context, cookies: dict, browser_lock: threading.Lo
     return build_extraction_result(pdf_text)
 
 
-def prefetch_direct_downloads(links, cookies: dict) -> dict:
+def prefetch_direct_downloads(links) -> dict:
     results = {}
     if not links: return results
 
     with ThreadPoolExecutor(max_workers=PREFETCH_WORKERS) as executor:
         future_to_link = {
-            executor.submit(try_direct_download, link, cookies): link
+            executor.submit(try_direct_download, link): link
             for link in links
         }
         for future in as_completed(future_to_link):
@@ -413,7 +424,6 @@ def process_sheet():
     extraction_idx = indices[EXTRACTION_HEADER]
     status_idx = indices[STATUS_HEADER]
 
-    cookies = load_cookies_from_session_data(TRACXN_SESSION_DATA)
     last_col_letter = col_num_to_letter(max(indices.values()) + 1)
     total_rows_in_sheet = input_sheet.row_count
 
@@ -427,20 +437,41 @@ def process_sheet():
             if s.strip() == STATUS_CLAUSE_MATCHED:
                 successful_cins.add(c.strip())
         print(f"Found {len(successful_cins)} CINs that already have '{STATUS_CLAUSE_MATCHED}'.")
+        # These two lists can be large for big sheets -- drop them once we've
+        # extracted what we need instead of keeping them alive for the rest
+        # of the run.
+        del all_cins, all_statuses
     except Exception as e:
         print(f"Warning: Initial status pre-scan failed ({e}). Proceeding without seeding memory.")
 
-    extracted_result_cache = {}
-
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(storage_state=TRACXN_SESSION_DATA)
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--no-sandbox",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--disable-background-timer-throttling",
+                "--disable-renderer-backgrounding",
+                "--js-flags=--max-old-space-size=128",
+            ],
+        )
+        context = browser.new_context()
         browser_lock = threading.Lock()
 
         current_row = START_ROW
         print(f"\n--- Starting processing from row {START_ROW} ---")
 
         while current_row <= total_rows_in_sheet:
+            # NOTE: extracted_result_cache is now scoped PER BATCH (declared
+            # inside the loop) instead of once for the whole run. Previously
+            # it accumulated every extracted PDF's full text for the entire
+            # execution and was never freed -- on a large sheet that alone
+            # could account for hundreds of MB by the end of the run.
+            extracted_result_cache = {}
+
             batch_start = current_row
             batch_end = min(current_row + INPUT_BATCH_SIZE - 1, total_rows_in_sheet)
 
@@ -509,11 +540,15 @@ def process_sheet():
             if not row_infos and not rows_to_skip:
                 print("  Nothing new to process or mark in this batch.")
                 current_row = batch_end + 1
+                # Nothing was written, but this batch's row data is no
+                # longer needed -- drop it before moving to the next batch.
+                del chunk_rows, row_infos, rows_to_skip, unique_links, extracted_result_cache
+                gc.collect()
                 continue
 
             # PREFETCH & EXTRACT
             if unique_links:
-                prefetch_cache = prefetch_direct_downloads(unique_links, cookies)
+                prefetch_cache = prefetch_direct_downloads(unique_links)
                 docs_to_extract = sorted(link for link in unique_links if link not in extracted_result_cache)
 
                 if docs_to_extract:
@@ -521,7 +556,7 @@ def process_sheet():
                         future_to_link = {
                             executor.submit(
                                 extract_doc_text_parallel,
-                                context, cookies, browser_lock, link,
+                                context, browser_lock, link,
                                 prefetch_cache.get(link),
                             ): link
                             for link in docs_to_extract
@@ -533,6 +568,12 @@ def process_sheet():
                             except Exception as e:
                                 extract_text, status_value = "Content not available", STATUS_NONE
                             extracted_result_cache[link] = (extract_text, status_value)
+
+                # prefetch_cache holds raw PDF bytes for every link in this
+                # batch -- release it as soon as extraction is done rather
+                # than waiting for the next batch's reassignment.
+                prefetch_cache.clear()
+                del prefetch_cache
 
             # ASSEMBLE NEW VALUES
             new_extraction_values = {}
@@ -569,6 +610,21 @@ def process_sheet():
                 input_sheet, batch_start, batch_end, status_idx,
                 chunk_rows, new_status_values, STATUS_HEADER,
             )
+
+            # Both columns are now safely written to the sheet -- everything
+            # this batch held in memory (raw row data, extracted PDF text,
+            # the values just written) can be freed immediately. Don't wait
+            # until the next loop iteration reassigns these names.
+            del (
+                chunk_rows,
+                row_infos,
+                rows_to_skip,
+                unique_links,
+                extracted_result_cache,
+                new_extraction_values,
+                new_status_values,
+            )
+            gc.collect()
 
             current_row = batch_end + 1
 
