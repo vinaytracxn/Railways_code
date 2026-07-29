@@ -1,42 +1,3 @@
-"""
-download_documents.py
-
-Python port of the Google Apps Script "downloadAllDocuments" flow.
-
-Unlike the Apps Script version (which relied on script-trigger resumption
-via PropertiesService because of the 6-minute execution limit), this script
-loops internally and processes ALL rows, batch by batch, in one continuous
-run. Nothing stops until every row has been handled.
-
-Column layout (per row):
-    E  -> source document URL (input)
-    F  -> resulting Google Drive link (output, written by this script)
-
-Behavior notes:
-    - If a row's target filename is already present in the Drive folder but
-      column F is empty, we do NOT skip it silently anymore -- we write the
-      existing file's Drive link back into column F. This guarantees no row
-      is left "unprocessed" just because its file happens to already exist.
-    - To keep things fast, the filename is derived from the signed URL
-      *before* downloading the actual PDF bytes. If that filename already
-      exists in Drive, we skip the (expensive) PDF download entirely and
-      just backfill the link.
-
-Requirements:
-    pip install google-auth google-api-python-client requests
-
-CREDENTIALS (Railway note):
-    Railway has no persistent filesystem to upload service_account.json to,
-    so credentials are read from the SERVICE_ACCOUNT_JSON environment
-    variable (the raw JSON contents of the key file, pasted as one value)
-    instead. If that env var isn't set, it falls back to reading
-    CONFIG["SERVICE_ACCOUNT_FILE"] from disk, so this still works
-    unchanged when run locally.
-
-Tokens are read from the "Config" sheet (column B, starting row 2), same
-as the original Apps Script -- a random token is picked per request.
-"""
-
 import json
 import os
 import time
@@ -71,7 +32,7 @@ CONFIG = {
 
     "DRIVE_FOLDER_ID": os.environ.get("DRIVE_FOLDER_ID", "15KsJ1a51I4n6132IIK-qCGJSVoaBCU0g"),
 
-    "SERVICE_ACCOUNT_FILE": json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
+    "SERVICE_ACCOUNT_FILE": "service_account.json",
 
     "SLEEP_BETWEEN_BATCHES": 0.25,  # seconds
 
@@ -104,12 +65,7 @@ def get_session():
 # AUTH / CLIENTS
 # =========================================================
 def get_credentials():
-    """
-    Prefers the SERVICE_ACCOUNT_JSON env var (raw JSON string) so this can
-    run on Railway without a filesystem upload. Falls back to reading
-    CONFIG["SERVICE_ACCOUNT_FILE"] from disk for local runs.
-    """
-    raw_json = os.environ.get("SERVICE_ACCOUNT_JSON")
+    raw_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
     if raw_json:
         info = json.loads(raw_json)
         return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
@@ -166,11 +122,6 @@ def read_all_values(sheets_service):
 
 
 def build_request_list(values):
-    """
-    values is 0-indexed (row 0 = sheet row 1).
-    Only column E (DOC_URL_COLUMN) is read per row. Rows that already have
-    a Drive link in column F are skipped (if SKIP_ROWS_WITH_EXISTING_LINK).
-    """
     requests_list = []
     start_row = CONFIG["START_ROW"]
     doc_col = CONFIG["DOC_URL_COLUMN"]
@@ -207,10 +158,6 @@ def col_num_to_letter(n):
 
 
 def write_links_batch(sheets_service, link_updates):
-    """
-    link_updates: list of (row, link) tuples.
-    Writes each link to column F of its respective row in one batchUpdate call.
-    """
     if not link_updates:
         return
 
@@ -233,13 +180,6 @@ def write_links_batch(sheets_service, link_updates):
 # DRIVE HELPERS
 # =========================================================
 def verify_folder_access(drive_service, folder_id):
-    """
-    Fails fast with a clear message instead of letting every upload 404.
-    A 404 here almost always means either:
-      1) the folder ID is wrong, or
-      2) the folder hasn't been shared with the service account's email, or
-      3) the folder lives in a Shared Drive (needs supportsAllDrives).
-    """
     try:
         folder = (
             drive_service.files()
@@ -249,7 +189,7 @@ def verify_folder_access(drive_service, folder_id):
         print(f"Drive folder OK: '{folder.get('name')}' (id: {folder.get('id')})")
     except Exception as e:
         sa_email = "?"
-        raw_json = os.environ.get("SERVICE_ACCOUNT_JSON")
+        raw_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
         try:
             if raw_json:
                 sa_email = json.loads(raw_json).get("client_email", "?")
@@ -268,12 +208,6 @@ def verify_folder_access(drive_service, folder_id):
 
 
 def get_existing_files(drive_service, folder_id):
-    """
-    Preload existing files in the target folder as a {filename: driveLink}
-    map. This lets us both (a) avoid re-downloading files that already
-    exist, and (b) backfill column F for rows whose file already exists
-    but whose sheet row was never marked with a link.
-    """
     files = {}
     page_token = None
     query = f"'{folder_id}' in parents and trashed = false"
@@ -303,7 +237,6 @@ def get_existing_files(drive_service, folder_id):
 
 
 def upload_to_drive(drive_service, folder_id, filename, content_bytes):
-    """Uploads the PDF and returns its Drive webViewLink (shareable link)."""
     media = MediaIoBaseUpload(
         io.BytesIO(content_bytes), mimetype="application/pdf", resumable=False
     )
@@ -321,7 +254,6 @@ def upload_to_drive(drive_service, folder_id, filename, content_bytes):
 
     link = created.get("webViewLink")
     if not link:
-        # Fallback: construct the standard viewer link from the file id.
         link = f"https://drive.google.com/file/d/{created['id']}/view"
     return link
 
@@ -330,7 +262,6 @@ def upload_to_drive(drive_service, folder_id, filename, content_bytes):
 # FILENAME RESOLUTION
 # =========================================================
 def filename_from_url(signed_url):
-    """Cheap, network-free filename guess derived purely from the URL path."""
     try:
         path = urlsplit(signed_url).path
         filename = unquote(path.rsplit("/", 1)[-1])
@@ -359,7 +290,6 @@ def fallback_filename():
 # PER-ITEM PROCESSING
 # =========================================================
 def resolve_signed_url(item, token):
-    """First request: get the redirect (Location header) signed URL."""
     try:
         resp = get_session().get(
             item["url"],
@@ -378,7 +308,6 @@ def resolve_signed_url(item, token):
 
 
 def download_pdf(signed_url):
-    """Second request: download the actual PDF bytes (only when needed)."""
     try:
         resp = get_session().get(signed_url, timeout=60)
         if resp.status_code != 200:
@@ -391,23 +320,11 @@ def download_pdf(signed_url):
 
 
 def process_item(item, tokens, existing_files, existing_lock):
-    """
-    Runs the resolve + (maybe) download steps for a single row.
-
-    Returns a dict:
-      {"row": row, "status": "existing", "filename": name, "link": link}
-        -> file already in Drive; caller just needs to write the link back.
-      {"row": row, "status": "uploaded", "filename": name, "content": bytes}
-        -> new file, caller must upload it.
-      None -> nothing usable (resolve/download failure).
-    """
     token = random_token(tokens)
     signed_url = resolve_signed_url(item, token)
     if not signed_url:
         return None
 
-    # Cheap, network-free filename guess first -- lets us skip the (large)
-    # PDF download entirely if the file is already sitting in Drive.
     guessed_name = filename_from_url(signed_url)
     if guessed_name:
         with existing_lock:
@@ -426,7 +343,6 @@ def process_item(item, tokens, existing_files, existing_lock):
 
     filename = guessed_name or filename_from_headers(headers or {}) or fallback_filename()
 
-    # Re-check in case another thread just uploaded the same filename.
     with existing_lock:
         existing_link = existing_files.get(filename)
     if existing_link:
@@ -449,7 +365,7 @@ def process_item(item, tokens, existing_files, existing_lock):
 # BATCH PROCESSING
 # =========================================================
 def process_batch(batch, tokens, drive_service, folder_id, existing_files, existing_lock, sheets_service):
-    link_updates = []  # (row, link) to write back to column F
+    link_updates = []
 
     with ThreadPoolExecutor(max_workers=CONFIG["MAX_WORKERS"]) as pool:
         futures = {
@@ -469,14 +385,10 @@ def process_batch(batch, tokens, drive_service, folder_id, existing_files, exist
                 continue
 
             if result["status"] == "existing":
-                # File already lives in Drive -- backfill column F, no
-                # re-upload needed. This is exactly the "unprocessed row"
-                # case: existing file, empty column F.
                 link_updates.append((result["row"], result["link"]))
                 print(f"Already in Drive, backfilling link: {result['filename']} -> row {result['row']}")
                 continue
 
-            # status == "uploaded"
             filename = result["filename"]
             content = result["content"]
             try:
@@ -488,7 +400,6 @@ def process_batch(batch, tokens, drive_service, folder_id, existing_files, exist
             except Exception as e:
                 print(f"Upload failed for {filename}: {e}")
 
-    # Write all Drive links for this batch back to column F in one call.
     try:
         write_links_batch(sheets_service, link_updates)
     except Exception as e:
