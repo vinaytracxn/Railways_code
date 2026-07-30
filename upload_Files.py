@@ -19,10 +19,10 @@ from googleapiclient.http import MediaIoBaseUpload
 CONFIG = {
     # These four now come from environment variables (Railway -> Variables),
     # falling back to the original hardcoded values if not set.
-    "SHEET_ID": os.environ.get("SHEET_ID", "1JKtnqXf4va9vp1apkuJ6eZ_uao_cXGuacbfvnzCJUNA"),
-    "SHEET_NAME": os.environ.get("SHEET_NAME", "Sheet1"),
-    "SERVICE_ACCOUNT_FILE": os.environ.get("SERVICE_ACCOUNT_FILE", "/Users/vinay/Desktop/json/ss.json"),
-    "DRIVE_FOLDER_ID": os.environ.get("DRIVE_FOLDER_ID", "15KsJ1a51I4n6132IIK-qCGJSVoaBCU0g"),
+    "SHEET_ID": os.environ.get("SHEET_ID"),
+    "SHEET_NAME": os.environ.get("SHEET_NAME"),
+    "SERVICE_ACCOUNT_FILE": os.environ.get("SERVICE_ACCOUNT_FILE"),
+    "DRIVE_FOLDER_ID": os.environ.get("DRIVE_FOLDER_ID"),
 
     "CONFIG_SHEET": "Config",      # sheet holding tokens in column B
 
@@ -66,9 +66,22 @@ def get_session():
 # AUTH / CLIENTS
 # =========================================================
 def get_credentials():
-    return service_account.Credentials.from_service_account_file(
-        CONFIG["SERVICE_ACCOUNT_FILE"], scopes=SCOPES
-    )
+    raw = CONFIG["SERVICE_ACCOUNT_FILE"].strip()
+
+    # If SERVICE_ACCOUNT_FILE holds the JSON key contents directly (starts
+    # with '{'), parse it as JSON instead of trying to open() it as a path.
+    if raw.startswith("{"):
+        try:
+            info = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                "SERVICE_ACCOUNT_FILE looks like JSON but failed to parse. "
+                "Make sure the full key file contents were pasted correctly."
+            ) from e
+        return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+
+    # Otherwise treat it as a real path on disk.
+    return service_account.Credentials.from_service_account_file(raw, scopes=SCOPES)
 
 
 def get_sheets_service(creds):
@@ -202,8 +215,12 @@ def verify_folder_access(drive_service, folder_id):
     except Exception as e:
         sa_email = "?"
         try:
-            with open(CONFIG["SERVICE_ACCOUNT_FILE"], "r") as f:
-                sa_email = json.load(f).get("client_email", "?")
+            raw = CONFIG["SERVICE_ACCOUNT_FILE"].strip()
+            if raw.startswith("{"):
+                sa_email = json.loads(raw).get("client_email", "?")
+            else:
+                with open(raw, "r") as f:
+                    sa_email = json.load(f).get("client_email", "?")
         except Exception:
             pass
         raise RuntimeError(
