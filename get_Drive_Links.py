@@ -35,6 +35,12 @@ CONFIG = {
     "MASTER_COL_EXTRACTION_STATUS": 7, # G - Extarction status
 
     "DRIVE_STATUS_DONE": "Done",
+    "DRIVE_STATUS_PROCESSING": "Processing",
+
+    # Username written into the master sheet's User column (D) when a row
+    # is picked up for processing. Set this via env var so different
+    # deployments/runners can identify themselves.
+    "PROCESS_USER": os.environ.get("PROCESS_USER"),
 
     # ---- Target sheet layout (same for every sheet linked in master) ----
     "TARGET_SHEET_NAME": "Sheet1",
@@ -209,6 +215,17 @@ def write_master_status(sheets_service, master_row, status_text):
     sheets_service.spreadsheets().values().update(
         spreadsheetId=CONFIG["MASTER_SHEET_ID"],
         range=f"{CONFIG['MASTER_SHEET_NAME']}!{status_col_letter}{master_row}",
+        valueInputOption="USER_ENTERED",
+        body=body,
+    ).execute()
+
+
+def write_master_user(sheets_service, master_row, user_name):
+    user_col_letter = col_num_to_letter(CONFIG["MASTER_COL_USER"])
+    body = {"values": [[user_name]]}
+    sheets_service.spreadsheets().values().update(
+        spreadsheetId=CONFIG["MASTER_SHEET_ID"],
+        range=f"{CONFIG['MASTER_SHEET_NAME']}!{user_col_letter}{master_row}",
         valueInputOption="USER_ENTERED",
         body=body,
     ).execute()
@@ -586,6 +603,11 @@ def main():
         sheet_id = entry["sheet_id"]
 
         try:
+            # Claim this row before doing any work: stamp the User column
+            # and mark status "Processing" so other/concurrent runs skip it.
+            write_master_user(sheets_service, master_row, CONFIG["PROCESS_USER"])
+            write_master_status(sheets_service, master_row, CONFIG["DRIVE_STATUS_PROCESSING"])
+
             process_target_sheet(sheet_id, sheets_service, drive_service)
             write_master_status(sheets_service, master_row, CONFIG["DRIVE_STATUS_DONE"])
             print(f"Marked master row {master_row} as '{CONFIG['DRIVE_STATUS_DONE']}'.")
