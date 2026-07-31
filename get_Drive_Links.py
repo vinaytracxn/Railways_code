@@ -58,12 +58,12 @@ CONFIG = {
     # in memory at once. Each concurrent worker streams (not fully buffers)
     # a PDF, but Railway's free/small plans have very little RAM headroom,
     # so keep this conservative. Override via env vars if you have more RAM.
-    "REQUEST_BATCH_SIZE": int(os.environ.get("REQUEST_BATCH_SIZE", 6)),
-    "MAX_WORKERS": int(os.environ.get("MAX_WORKERS", 6)),
+    "REQUEST_BATCH_SIZE": int(os.environ.get("REQUEST_BATCH_SIZE", 40)),
+    "MAX_WORKERS": int(os.environ.get("MAX_WORKERS", 10)),
 
     # Bytes per chunk when streaming a PDF from source -> Google Drive.
     # Smaller = less peak RAM per concurrent upload, slightly more HTTP overhead.
-    "UPLOAD_CHUNK_SIZE": int(os.environ.get("UPLOAD_CHUNK_SIZE", 4 * 1024 * 1024)),  # 4MB
+    "UPLOAD_CHUNK_SIZE": int(os.environ.get("UPLOAD_CHUNK_SIZE", 80 * 1024 * 1024)),  # 40MB
 
     "SLEEP_BETWEEN_BATCHES": 0.25,  # seconds
 }
