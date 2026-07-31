@@ -4,6 +4,8 @@ import time
 import re
 import gc
 import threading
+import shutil
+import tempfile
 from datetime import datetime
 from urllib.parse import unquote, urlsplit
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -26,13 +28,13 @@ CONFIG = {
     "MASTER_START_ROW": 2,  # 1-indexed, matches the sheet
 
     # Master sheet columns (1-indexed)
-    "MASTER_COL_SNO": 1,               # A - Sno
-    "MASTER_COL_DOC_TYPE": 2,          # B - Doc Type
-    "MASTER_COL_SHEET_LINK": 3,        # C - Sheet Link
-    "MASTER_COL_USER": 4,              # D - User
-    "MASTER_COL_DRIVE_STATUS": 5,      # E - Drive Link Status
-    "MASTER_COL_EXTRACTION_USER": 6,   # F - extraction User
-    "MASTER_COL_EXTRACTION_STATUS": 7, # G - Extarction status
+    "MASTER_COL_SNO": 1,  # A - Sno
+    "MASTER_COL_DOC_TYPE": 2,  # B - Doc Type
+    "MASTER_COL_SHEET_LINK": 3,  # C - Sheet Link
+    "MASTER_COL_USER": 4,  # D - User
+    "MASTER_COL_DRIVE_STATUS": 5,  # E - Drive Link Status
+    "MASTER_COL_EXTRACTION_USER": 6,  # F - extraction User
+    "MASTER_COL_EXTRACTION_STATUS": 7,  # G - Extarction status
 
     "DRIVE_STATUS_DONE": "Done",
     "DRIVE_STATUS_PROCESSING": "Processing",
@@ -44,12 +46,12 @@ CONFIG = {
 
     # ---- Target sheet layout (same for every sheet linked in master) ----
     "TARGET_SHEET_NAME": "Sheet1",
-    "TARGET_START_ROW": 2,        # 1-indexed
-    "DOC_URL_COLUMN": 5,          # E (1-indexed) - source document URL
-    "DRIVE_LINK_COLUMN": 6,       # F (1-indexed) - resulting Drive link written back
+    "TARGET_START_ROW": 2,  # 1-indexed
+    "DOC_URL_COLUMN": 5,  # E (1-indexed) - source document URL
+    "DRIVE_LINK_COLUMN": 6,  # F (1-indexed) - resulting Drive link written back
     "SKIP_ROWS_WITH_EXISTING_LINK": True,
 
-    "CONFIG_SHEET": "Config",     # sheet holding tokens in column B, lives in each target sheet
+    "CONFIG_SHEET": "Config",  # sheet holding tokens in column B, lives in each target sheet
 
     "ROW_BATCH_SIZE": 100,
     # Lowered from 40 -> much smaller so we only ever hold a handful of PDFs
@@ -359,31 +361,43 @@ def get_existing_files(drive_service, folder_id):
 
 
 def upload_stream_to_drive(drive_service, folder_id, filename, file_like_obj):
-    """Uploads directly from a file-like stream (e.g. resp.raw) instead of
-    a fully-buffered bytes object. Combined with a small chunksize this caps
-    peak RAM per upload to roughly UPLOAD_CHUNK_SIZE, regardless of PDF size."""
-    media = MediaIoBaseUpload(
-        file_like_obj,
-        mimetype="application/pdf",
-        chunksize=CONFIG["UPLOAD_CHUNK_SIZE"],
-        resumable=True,
-    )
-    file_metadata = {"name": filename, "parents": [folder_id]}
-    request = drive_service.files().create(
-        body=file_metadata,
-        media_body=media,
-        fields="id, webViewLink",
-        supportsAllDrives=True,
-    )
+    """
+    Streams the network response to an ephemeral file on disk first, keeping RAM low.
+    This provides the Google API client with the seek() and tell() capabilities it requires.
+    """
+    # Create an auto-deleting temporary file
+    with tempfile.NamedTemporaryFile(delete=True) as temp_pdf:
+        # Stream the download into the temp file on disk (default 64KB chunks in memory)
+        shutil.copyfileobj(file_like_obj, temp_pdf)
+        temp_pdf.flush()
 
-    response = None
-    while response is None:
-        _, response = request.next_chunk()
+        # Rewind the file pointer so Google Drive can read it from the beginning
+        temp_pdf.seek(0)
 
-    link = response.get("webViewLink")
-    if not link:
-        link = f"https://drive.google.com/file/d/{response['id']}/view"
-    return link
+        media = MediaIoBaseUpload(
+            temp_pdf,
+            mimetype="application/pdf",
+            chunksize=CONFIG["UPLOAD_CHUNK_SIZE"],
+            resumable=True,
+        )
+
+        file_metadata = {"name": filename, "parents": [folder_id]}
+        request = drive_service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields="id, webViewLink",
+            supportsAllDrives=True,
+        )
+
+        response = None
+        while response is None:
+            _, response = request.next_chunk()
+
+        link = response.get("webViewLink")
+        if not link:
+            link = f"https://drive.google.com/file/d/{response['id']}/view"
+
+        return link
 
 
 # =========================================================
@@ -526,7 +540,7 @@ def process_batch(batch, tokens, drive_service, folder_id, existing_files, exist
                 print(f"Already in Drive, backfilling link: {result['filename']} -> row {result['row']}")
                 continue
 
-            # status == "to_upload" -- stream straight from source response to Drive
+            # status == "to_upload" -- stream straight from source response to disk, then Drive
             filename = result["filename"]
             resp = result["response"]
             try:
@@ -534,7 +548,7 @@ def process_batch(batch, tokens, drive_service, folder_id, existing_files, exist
                 with existing_lock:
                     existing_files[filename] = link
                 link_updates.append((result["row"], link))
-                print(f"Streamed: {filename} -> row {result['row']}")
+                print(f"Uploaded: {filename} -> row {result['row']}")
             except Exception as e:
                 print(f"Upload failed for {filename}: {e}")
             finally:
