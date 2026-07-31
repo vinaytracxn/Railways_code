@@ -1,3 +1,56 @@
+"""
+download_documents.py
+
+Master-queue orchestrator + per-child-sheet document downloader.
+
+WHAT THIS DOES
+==============
+1. Reads the "Master MOA Docs Sheet" (Sheet1). Each row looks like:
+
+       Sno | Doc Type | Doc Link | User | Drive Link Status | extraction User | Extarction status
+
+   "Doc Link" points to ANOTHER Google Spreadsheet (a "child" sheet) which
+   has the original column layout:
+       E -> source document URL (input)
+       F -> resulting Google Drive link (output)
+
+2. The script scans the master sheet top to bottom for the first row where:
+       - Doc Link is non-empty
+       - User is empty
+   (Drive Link Status is ignored when deciding claimability -- this also
+   picks up rows that were half-updated by a previous crashed run.)
+
+3. It "claims" that row by writing:
+       User               -> WORKER_USER (from env var)
+       Drive Link Status  -> "Processing"
+
+4. It extracts the child spreadsheet ID from the Doc Link URL and runs the
+   full download/upload/backfill pipeline against that child sheet (same
+   logic as the original single-sheet script).
+
+5. Once the child sheet has no more pending rows, it goes back to the
+   master sheet and sets that row's Drive Link Status -> "Done".
+
+6. It repeats from step 2, claiming the next unclaimed row, until no
+   unclaimed rows with a Doc Link remain.
+
+   "extraction User" / "Extarction status" columns belong to a separate
+   downstream process and are never touched here.
+
+Requirements:
+    pip install google-auth google-api-python-client requests
+
+Env vars:
+    MASTER_SHEET_ID        (defaults to the Master MOA Docs Sheet id below)
+    MASTER_SHEET_NAME       (defaults to "Sheet1")
+    CHILD_SHEET_NAME        (defaults to "Sheet1" -- tab name inside each
+                              child spreadsheet)
+    WORKER_USER             (REQUIRED -- name written into the "User" /
+                              claim column so multiple workers don't race)
+    SERVICE_ACCOUNT_FILE    (a file path OR the raw JSON key contents)
+    DRIVE_FOLDER_ID         (Drive folder every downloaded PDF is uploaded to)
+"""
+
 import os
 import json
 import time
@@ -18,8 +71,10 @@ from googleapiclient.http import MediaIoBaseUpload
 # =========================================================
 CONFIG = {
     # ---- Master queue sheet ----
-    "MASTER_SHEET_ID": "1oNr3g2Pjpyu9u09w0lCFVT9vJwbBGn8O2rbx4kvjd88",
-    "MASTER_SHEET_NAME": "Sheet1",
+    "MASTER_SHEET_ID": os.environ.get(
+        "MASTER_SHEET_ID", "1oNr3g2Pjpyu9u09w0lCFVT9vJwbBGn8O2rbx4kvjd88"
+    ),
+    "MASTER_SHEET_NAME": os.environ.get("MASTER_SHEET_NAME", "Sheet1"),
 
     # Master sheet columns (1-indexed)
     "MASTER_SNO_COL": 1,
@@ -34,7 +89,7 @@ CONFIG = {
     "WORKER_USER": os.environ.get("WORKER_USER"),
 
     # ---- Child sheet (per Doc Link) ----
-    "CHILD_SHEET_NAME": "Sheet1",
+    "CHILD_SHEET_NAME": os.environ.get("CHILD_SHEET_NAME", "Sheet1"),
     "CHILD_CONFIG_SHEET": "Config",   # sheet holding tokens in column B
     "CHILD_START_ROW": 2,             # 1-indexed, matches the sheet
     "CHILD_DOC_URL_COLUMN": 5,        # E - source document URL
