@@ -20,6 +20,7 @@ CONFIG = {
     # ---- Master queue sheet ----
     "MASTER_SHEET_ID": "1oNr3g2Pjpyu9u09w0lCFVT9vJwbBGn8O2rbx4kvjd88",
     "MASTER_SHEET_NAME": "Sheet1",
+
     # Master sheet columns (1-indexed)
     "MASTER_SNO_COL": 1,
     "MASTER_DOC_TYPE_COL": 2,
@@ -373,56 +374,19 @@ def get_existing_files(drive_service, folder_id):
     return files
 
 
-def get_shared_emails(drive_service, file_id):
+def share_file_with_project_emails(drive_service, file_id):
     """
-    Returns the set of PROJECT_SHARE_EMAILS that already have a permission
-    grant on this file. Used to avoid re-granting on files that were
-    already shared in a previous run.
+    Force-shares a newly uploaded Drive file with every address in
+    PROJECT_SHARE_EMAILS, using a single batched HTTP request instead of
+    one call per email. Only called for freshly uploaded files -- files
+    that already existed in the folder are left untouched.
     """
-    shared = set()
-    try:
-        resp = (
-            drive_service.permissions()
-            .list(
-                fileId=file_id,
-                fields="permissions(emailAddress,role)",
-                supportsAllDrives=True,
-            )
-            .execute()
-        )
-        for p in resp.get("permissions", []):
-            email = p.get("emailAddress")
-            if email in PROJECT_SHARE_EMAILS:
-                shared.add(email)
-    except Exception as e:
-        print(f"  Could not list existing permissions for {file_id}: {e}")
-    return shared
-
-
-def share_file_with_project_emails(drive_service, file_id, skip_already_shared=False):
-    """
-    Force-shares a Drive file with every address in PROJECT_SHARE_EMAILS,
-    using a single batched HTTP request instead of one call per email.
-
-    skip_already_shared=True first checks which emails already have a grant
-    (one extra API call) and only batches the missing ones -- worthwhile for
-    files that may have been shared in a previous run (the "existing"
-    backfill case). New uploads never need this check, since a freshly
-    created file can't have any grants yet.
-    """
-    emails_to_share = PROJECT_SHARE_EMAILS
-    if skip_already_shared:
-        already = get_shared_emails(drive_service, file_id)
-        emails_to_share = [e for e in PROJECT_SHARE_EMAILS if e not in already]
-        if not emails_to_share:
-            return  # already fully shared, nothing to do
-
     def _callback(request_id, response, exception):
         if exception:
             print(f"  Failed to share file {file_id} with {request_id}: {exception}")
 
     batch = drive_service.new_batch_http_request(callback=_callback)
-    for email in emails_to_share:
+    for email in PROJECT_SHARE_EMAILS:
         batch.add(
             drive_service.permissions().create(
                 fileId=file_id,
@@ -617,7 +581,6 @@ def process_batch(
                 # no re-upload needed. This is exactly the "unprocessed
                 # row" case: existing file, empty link column.
                 link_updates.append((result["row"], result["link"]))
-                share_file_with_project_emails(drive_service, result["file_id"], skip_already_shared=True)
                 print(f"Already in Drive, backfilling link: {result['filename']} -> row {result['row']}")
                 continue
 
