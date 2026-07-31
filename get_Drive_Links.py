@@ -40,7 +40,7 @@ CONFIG = {
     # Username written into the master sheet's User column (D) when a row
     # is picked up for processing. Set this via env var so different
     # deployments/runners can identify themselves.
-    "PROCESS_USER": os.environ.get("PROCESS_USER"),
+    "PROCESS_USER": os.environ.get("PROCESS_USER", ""),
 
     # ---- Target sheet layout (same for every sheet linked in master) ----
     "TARGET_SHEET_NAME": "Sheet1",
@@ -285,10 +285,17 @@ def write_links_batch(sheets_service, sheet_id, link_updates):
         for row, link in link_updates
     ]
 
+    print(f"[{sheet_id}] Writing {len(data)} link(s) to column {link_col_letter}: "
+          f"{[(row, link) for row, link in link_updates]}")
+
     body = {"valueInputOption": "USER_ENTERED", "data": data}
-    sheets_service.spreadsheets().values().batchUpdate(
+    resp = sheets_service.spreadsheets().values().batchUpdate(
         spreadsheetId=sheet_id, body=body
     ).execute()
+
+    total_updated = resp.get("totalUpdatedCells", "?")
+    print(f"[{sheet_id}] batchUpdate response: totalUpdatedCells={total_updated}, "
+          f"responses={len(resp.get('responses', []))}")
 
 
 # =========================================================
