@@ -175,6 +175,7 @@ def read_master_rows(sheets_service):
     start_row = CONFIG["MASTER_START_ROW"]
     link_col = CONFIG["MASTER_COL_SHEET_LINK"]
     status_col = CONFIG["MASTER_COL_DRIVE_STATUS"]
+    user_col = CONFIG["MASTER_COL_USER"]
 
     for row_index, row in enumerate(values):
         sheet_row = row_index + 1
@@ -188,6 +189,10 @@ def read_master_rows(sheets_service):
         status = row[status_col - 1] if status_col - 1 < len(row) else ""
         if status.strip().lower() == CONFIG["DRIVE_STATUS_DONE"].lower():
             continue  # already processed
+
+        user_val = row[user_col - 1] if user_col - 1 < len(row) else ""
+        if user_val.strip():
+            continue  # skip rows where User (col D) is already filled in; only pick empty ones
 
         sheet_id = extract_sheet_id_from_url(link)
         if not sheet_id:
