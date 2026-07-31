@@ -1,56 +1,3 @@
-"""
-download_documents.py
-
-Master-queue orchestrator + per-child-sheet document downloader.
-
-WHAT THIS DOES
-==============
-1. Reads the "Master MOA Docs Sheet" (Sheet1). Each row looks like:
-
-       Sno | Doc Type | Doc Link | User | Drive Link Status | extraction User | Extarction status
-
-   "Doc Link" points to ANOTHER Google Spreadsheet (a "child" sheet) which
-   has the original column layout:
-       E -> source document URL (input)
-       F -> resulting Google Drive link (output)
-
-2. The script scans the master sheet top to bottom for the first row where:
-       - Doc Link is non-empty
-       - User is empty
-   (Drive Link Status is ignored when deciding claimability -- this also
-   picks up rows that were half-updated by a previous crashed run.)
-
-3. It "claims" that row by writing:
-       User               -> WORKER_USER (from env var)
-       Drive Link Status  -> "Processing"
-
-4. It extracts the child spreadsheet ID from the Doc Link URL and runs the
-   full download/upload/backfill pipeline against that child sheet (same
-   logic as the original single-sheet script).
-
-5. Once the child sheet has no more pending rows, it goes back to the
-   master sheet and sets that row's Drive Link Status -> "Done".
-
-6. It repeats from step 2, claiming the next unclaimed row, until no
-   unclaimed rows with a Doc Link remain.
-
-   "extraction User" / "Extarction status" columns belong to a separate
-   downstream process and are never touched here.
-
-Requirements:
-    pip install google-auth google-api-python-client requests
-
-Env vars:
-    MASTER_SHEET_ID        (defaults to the Master MOA Docs Sheet id below)
-    MASTER_SHEET_NAME       (defaults to "Sheet1")
-    CHILD_SHEET_NAME        (defaults to "Sheet1" -- tab name inside each
-                              child spreadsheet)
-    WORKER_USER             (REQUIRED -- name written into the "User" /
-                              claim column so multiple workers don't race)
-    SERVICE_ACCOUNT_FILE    (a file path OR the raw JSON key contents)
-    DRIVE_FOLDER_ID         (Drive folder every downloaded PDF is uploaded to)
-"""
-
 import os
 import json
 import time
@@ -70,53 +17,28 @@ from googleapiclient.http import MediaIoBaseUpload
 # CONFIG
 # =========================================================
 CONFIG = {
-    # ---- Master queue sheet ----
-    "MASTER_SHEET_ID": os.environ.get(
-        "MASTER_SHEET_ID", "1oNr3g2Pjpyu9u09w0lCFVT9vJwbBGn8O2rbx4kvjd88"
-    ),
-    "MASTER_SHEET_NAME": os.environ.get("MASTER_SHEET_NAME", "Sheet1"),
-
-    # Master sheet columns (1-indexed)
-    "MASTER_SNO_COL": 1,
-    "MASTER_DOC_TYPE_COL": 2,
-    "MASTER_DOC_LINK_COL": 3,
-    "MASTER_USER_COL": 4,
-    "MASTER_STATUS_COL": 5,
-    "MASTER_EXTRACTION_USER_COL": 6,
-    "MASTER_EXTRACTION_STATUS_COL": 7,
-
-    # Name written into the master "User" column when this worker claims a row.
-    "WORKER_USER": os.environ.get("WORKER_USER"),
-
-    # ---- Child sheet (per Doc Link) ----
-    "CHILD_SHEET_NAME": os.environ.get("CHILD_SHEET_NAME", "Sheet1"),
-    "CHILD_CONFIG_SHEET": "Config",   # sheet holding tokens in column B
-    "CHILD_START_ROW": 2,             # 1-indexed, matches the sheet
-    "CHILD_DOC_URL_COLUMN": 5,        # E - source document URL
-    "CHILD_DRIVE_LINK_COLUMN": 6,     # F - resulting Drive link written back
-    "SKIP_ROWS_WITH_EXISTING_LINK": True,
-
-    # ---- Shared ----
+    # These four now come from environment variables (Railway -> Variables),
+    # falling back to the original hardcoded values if not set.
+    "SHEET_ID": os.environ.get("SHEET_ID"),
+    "SHEET_NAME": os.environ.get("SHEET_NAME"),
     "SERVICE_ACCOUNT_FILE": os.environ.get("SERVICE_ACCOUNT_FILE"),
     "DRIVE_FOLDER_ID": os.environ.get("DRIVE_FOLDER_ID"),
+
+    "CONFIG_SHEET": "Config",      # sheet holding tokens in column B
+
+    "START_ROW": 2,                # 1-indexed, matches the sheet
+
+    "DOC_URL_COLUMN": 5,           # E (1-indexed) - source document URL
+    "DRIVE_LINK_COLUMN": 6,        # F (1-indexed) - resulting Drive link written back
 
     "ROW_BATCH_SIZE": 100,
     "REQUEST_BATCH_SIZE": 40,      # parallel requests per sub-batch
     "MAX_WORKERS": 40,             # thread pool size for parallel fetches
-    "SLEEP_BETWEEN_BATCHES": 0.25,  # seconds
-}
 
-# Every uploaded (or backfilled) Drive file is force-shared with these
-# service-account emails, regardless of whether they already have access.
-PROJECT_SHARE_EMAILS = [
-    "python-ss@my-project-1718797367466.iam.gserviceaccount.com",
-    "ss-scraper-service@gen-lang-client-0608981289.iam.gserviceaccount.com",
-    "moa-process@gen-lang-client-0608981289.iam.gserviceaccount.com",
-    "amoa-process@gen-lang-client-0608981289.iam.gserviceaccount.com",
-    "emoa-process@gen-lang-client-0608981289.iam.gserviceaccount.com",
-    "pdf-extractor@pdf-extractor-501710.iam.gserviceaccount.com",
-]
-PROJECT_SHARE_ROLE = "writer"  # Editor access
+    "SLEEP_BETWEEN_BATCHES": 0.25,  # seconds
+
+    "SKIP_ROWS_WITH_EXISTING_LINK": True,  # skip rows where col F is already filled
+}
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -144,9 +66,7 @@ def get_session():
 # AUTH / CLIENTS
 # =========================================================
 def get_credentials():
-    raw = (CONFIG["SERVICE_ACCOUNT_FILE"] or "").strip()
-    if not raw:
-        raise ValueError("SERVICE_ACCOUNT_FILE env var is not set.")
+    raw = CONFIG["SERVICE_ACCOUNT_FILE"].strip()
 
     # If SERVICE_ACCOUNT_FILE holds the JSON key contents directly (starts
     # with '{'), parse it as JSON instead of trying to open() it as a path.
@@ -172,14 +92,14 @@ def get_drive_service(creds):
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
-def get_tokens(sheets_service, child_sheet_id):
-    """Reads tokens from the child sheet's Config tab, column B, starting row 2."""
+def get_tokens(sheets_service):
+    """Reads tokens from the Config sheet, column B, starting row 2."""
     result = (
         sheets_service.spreadsheets()
         .values()
         .get(
-            spreadsheetId=child_sheet_id,
-            range=f"{CONFIG['CHILD_CONFIG_SHEET']}!B2:B",
+            spreadsheetId=CONFIG["SHEET_ID"],
+            range=f"{CONFIG['CONFIG_SHEET']}!B2:B",
         )
         .execute()
     )
@@ -187,9 +107,7 @@ def get_tokens(sheets_service, child_sheet_id):
     tokens = [r[0] for r in rows if r and r[0]]
 
     if not tokens:
-        raise ValueError(
-            f"No tokens found in the Config sheet (column B) of child sheet {child_sheet_id}."
-        )
+        raise ValueError("No tokens found in the Config sheet (column B).")
 
     return tokens
 
@@ -200,117 +118,28 @@ def random_token(tokens):
 
 
 # =========================================================
-# GENERIC SHEET HELPERS
+# SHEET READING
 # =========================================================
-def col_num_to_letter(n):
-    letters = ""
-    while n > 0:
-        n, remainder = divmod(n - 1, 26)
-        letters = chr(65 + remainder) + letters
-    return letters
-
-
-def read_all_values(sheets_service, spreadsheet_id, sheet_name):
+def read_all_values(sheets_service):
     result = (
         sheets_service.spreadsheets()
         .values()
-        .get(spreadsheetId=spreadsheet_id, range=sheet_name)
+        .get(spreadsheetId=CONFIG["SHEET_ID"], range=CONFIG["SHEET_NAME"])
         .execute()
     )
     return result.get("values", [])
 
 
-def write_row_cells(sheets_service, spreadsheet_id, sheet_name, row, col_to_value):
-    """
-    col_to_value: dict of {col_index (1-indexed): value}. Writes each cell
-    in a single batchUpdate call.
-    """
-    if not col_to_value:
-        return
-    data = [
-        {
-            "range": f"{sheet_name}!{col_num_to_letter(col)}{row}",
-            "values": [[value]],
-        }
-        for col, value in col_to_value.items()
-    ]
-    body = {"valueInputOption": "USER_ENTERED", "data": data}
-    sheets_service.spreadsheets().values().batchUpdate(
-        spreadsheetId=spreadsheet_id, body=body
-    ).execute()
-
-
-# =========================================================
-# MASTER SHEET QUEUE LOGIC
-# =========================================================
-def extract_sheet_id_from_url(url):
-    """Pulls the {id} out of .../spreadsheets/d/{id}/edit ..."""
-    match = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", url or "")
-    return match.group(1) if match else None
-
-
-def find_next_unclaimed_master_row(master_values):
-    """
-    Returns (sheet_row, doc_link) for the first row where Doc Link is
-    non-empty and User is empty. Returns (None, None) if none remain.
-    """
-    doc_link_col = CONFIG["MASTER_DOC_LINK_COL"]
-    user_col = CONFIG["MASTER_USER_COL"]
-
-    for row_index, row in enumerate(master_values):
-        sheet_row = row_index + 1  # 1-indexed
-        if sheet_row == 1:
-            continue  # header row
-
-        doc_link = row[doc_link_col - 1] if doc_link_col - 1 < len(row) else None
-        if not doc_link:
-            continue  # nothing to process for this row
-
-        user = row[user_col - 1] if user_col - 1 < len(row) else None
-        if user:
-            continue  # already claimed
-
-        return sheet_row, doc_link
-
-    return None, None
-
-
-def claim_master_row(sheets_service, master_sheet_id, master_sheet_name, row):
-    write_row_cells(
-        sheets_service,
-        master_sheet_id,
-        master_sheet_name,
-        row,
-        {
-            CONFIG["MASTER_USER_COL"]: CONFIG["WORKER_USER"],
-            CONFIG["MASTER_STATUS_COL"]: "Processing",
-        },
-    )
-
-
-def mark_master_row_done(sheets_service, master_sheet_id, master_sheet_name, row):
-    write_row_cells(
-        sheets_service,
-        master_sheet_id,
-        master_sheet_name,
-        row,
-        {CONFIG["MASTER_STATUS_COL"]: "Done"},
-    )
-
-
-# =========================================================
-# CHILD SHEET: BUILD REQUEST LIST
-# =========================================================
 def build_request_list(values):
     """
     values is 0-indexed (row 0 = sheet row 1).
-    Only column E (CHILD_DOC_URL_COLUMN) is read per row. Rows that already
-    have a Drive link in column F are skipped (if SKIP_ROWS_WITH_EXISTING_LINK).
+    Only column E (DOC_URL_COLUMN) is read per row. Rows that already have
+    a Drive link in column F are skipped (if SKIP_ROWS_WITH_EXISTING_LINK).
     """
     requests_list = []
-    start_row = CONFIG["CHILD_START_ROW"]
-    doc_col = CONFIG["CHILD_DOC_URL_COLUMN"]
-    link_col = CONFIG["CHILD_DRIVE_LINK_COLUMN"]
+    start_row = CONFIG["START_ROW"]
+    doc_col = CONFIG["DOC_URL_COLUMN"]
+    link_col = CONFIG["DRIVE_LINK_COLUMN"]
 
     for row_index, row in enumerate(values):
         sheet_row = row_index + 1  # 1-indexed sheet row
@@ -331,19 +160,29 @@ def build_request_list(values):
     return requests_list
 
 
-def write_links_batch(sheets_service, spreadsheet_id, sheet_name, link_updates):
+# =========================================================
+# SHEET WRITING (Drive link back to column F)
+# =========================================================
+def col_num_to_letter(n):
+    letters = ""
+    while n > 0:
+        n, remainder = divmod(n - 1, 26)
+        letters = chr(65 + remainder) + letters
+    return letters
+
+
+def write_links_batch(sheets_service, link_updates):
     """
     link_updates: list of (row, link) tuples.
-    Writes each link to the Drive-link column of its respective row in one
-    batchUpdate call.
+    Writes each link to column F of its respective row in one batchUpdate call.
     """
     if not link_updates:
         return
 
-    link_col_letter = col_num_to_letter(CONFIG["CHILD_DRIVE_LINK_COLUMN"])
+    link_col_letter = col_num_to_letter(CONFIG["DRIVE_LINK_COLUMN"])
     data = [
         {
-            "range": f"{sheet_name}!{link_col_letter}{row}",
+            "range": f"{CONFIG['SHEET_NAME']}!{link_col_letter}{row}",
             "values": [[link]],
         }
         for row, link in link_updates
@@ -351,7 +190,7 @@ def write_links_batch(sheets_service, spreadsheet_id, sheet_name, link_updates):
 
     body = {"valueInputOption": "USER_ENTERED", "data": data}
     sheets_service.spreadsheets().values().batchUpdate(
-        spreadsheetId=spreadsheet_id, body=body
+        spreadsheetId=CONFIG["SHEET_ID"], body=body
     ).execute()
 
 
@@ -376,7 +215,7 @@ def verify_folder_access(drive_service, folder_id):
     except Exception as e:
         sa_email = "?"
         try:
-            raw = (CONFIG["SERVICE_ACCOUNT_FILE"] or "").strip()
+            raw = CONFIG["SERVICE_ACCOUNT_FILE"].strip()
             if raw.startswith("{"):
                 sa_email = json.loads(raw).get("client_email", "?")
             else:
@@ -395,11 +234,10 @@ def verify_folder_access(drive_service, folder_id):
 
 def get_existing_files(drive_service, folder_id):
     """
-    Preload existing files in the target folder as a
-    {filename: {"link": driveLink, "id": fileId}} map. This lets us both
-    (a) avoid re-downloading files that already exist, and (b) backfill the
-    Drive-link column (and re-share) for rows whose file already exists but
-    whose sheet row was never marked with a link.
+    Preload existing files in the target folder as a {filename: driveLink}
+    map. This lets us both (a) avoid re-downloading files that already
+    exist, and (b) backfill column F for rows whose file already exists
+    but whose sheet row was never marked with a link.
     """
     files = {}
     page_token = None
@@ -421,7 +259,7 @@ def get_existing_files(drive_service, folder_id):
         )
         for f in resp.get("files", []):
             link = f.get("webViewLink") or f"https://drive.google.com/file/d/{f['id']}/view"
-            files[f["name"]] = {"link": link, "id": f["id"]}
+            files[f["name"]] = link
         page_token = resp.get("nextPageToken")
         if not page_token:
             break
@@ -429,38 +267,8 @@ def get_existing_files(drive_service, folder_id):
     return files
 
 
-def share_file_with_project_emails(drive_service, file_id):
-    """
-    Force-shares a newly uploaded Drive file with every address in
-    PROJECT_SHARE_EMAILS, using a single batched HTTP request instead of
-    one call per email. Only called for freshly uploaded files -- files
-    that already existed in the folder are left untouched.
-    """
-    def _callback(request_id, response, exception):
-        if exception:
-            print(f"  Failed to share file {file_id} with {request_id}: {exception}")
-
-    batch = drive_service.new_batch_http_request(callback=_callback)
-    for email in PROJECT_SHARE_EMAILS:
-        batch.add(
-            drive_service.permissions().create(
-                fileId=file_id,
-                body={
-                    "type": "user",
-                    "role": PROJECT_SHARE_ROLE,
-                    "emailAddress": email,
-                },
-                fields="id",
-                supportsAllDrives=True,
-                sendNotificationEmail=False,
-            ),
-            request_id=email,
-        )
-    batch.execute()
-
-
 def upload_to_drive(drive_service, folder_id, filename, content_bytes):
-    """Uploads the PDF and returns (file_id, webViewLink)."""
+    """Uploads the PDF and returns its Drive webViewLink (shareable link)."""
     media = MediaIoBaseUpload(
         io.BytesIO(content_bytes), mimetype="application/pdf", resumable=False
     )
@@ -476,12 +284,11 @@ def upload_to_drive(drive_service, folder_id, filename, content_bytes):
         .execute()
     )
 
-    file_id = created["id"]
     link = created.get("webViewLink")
     if not link:
         # Fallback: construct the standard viewer link from the file id.
-        link = f"https://drive.google.com/file/d/{file_id}/view"
-    return file_id, link
+        link = f"https://drive.google.com/file/d/{created['id']}/view"
+    return link
 
 
 # =========================================================
@@ -569,14 +376,13 @@ def process_item(item, tokens, existing_files, existing_lock):
     guessed_name = filename_from_url(signed_url)
     if guessed_name:
         with existing_lock:
-            existing_entry = existing_files.get(guessed_name)
-        if existing_entry:
+            existing_link = existing_files.get(guessed_name)
+        if existing_link:
             return {
                 "row": item["row"],
                 "status": "existing",
                 "filename": guessed_name,
-                "link": existing_entry["link"],
-                "file_id": existing_entry["id"],
+                "link": existing_link,
             }
 
     content, headers = download_pdf(signed_url)
@@ -587,14 +393,13 @@ def process_item(item, tokens, existing_files, existing_lock):
 
     # Re-check in case another thread just uploaded the same filename.
     with existing_lock:
-        existing_entry = existing_files.get(filename)
-    if existing_entry:
+        existing_link = existing_files.get(filename)
+    if existing_link:
         return {
             "row": item["row"],
             "status": "existing",
             "filename": filename,
-            "link": existing_entry["link"],
-            "file_id": existing_entry["id"],
+            "link": existing_link,
         }
 
     return {
@@ -606,13 +411,10 @@ def process_item(item, tokens, existing_files, existing_lock):
 
 
 # =========================================================
-# BATCH PROCESSING (within a single child sheet)
+# BATCH PROCESSING
 # =========================================================
-def process_batch(
-    batch, tokens, drive_service, folder_id, existing_files, existing_lock,
-    sheets_service, child_sheet_id, child_sheet_name,
-):
-    link_updates = []  # (row, link) to write back to the Drive-link column
+def process_batch(batch, tokens, drive_service, folder_id, existing_files, existing_lock, sheets_service):
+    link_updates = []  # (row, link) to write back to column F
 
     with ThreadPoolExecutor(max_workers=CONFIG["MAX_WORKERS"]) as pool:
         futures = {
@@ -632,9 +434,9 @@ def process_batch(
                 continue
 
             if result["status"] == "existing":
-                # File already lives in Drive -- backfill the link column,
-                # no re-upload needed. This is exactly the "unprocessed
-                # row" case: existing file, empty link column.
+                # File already lives in Drive -- backfill column F, no
+                # re-upload needed. This is exactly the "unprocessed row"
+                # case: existing file, empty column F.
                 link_updates.append((result["row"], result["link"]))
                 print(f"Already in Drive, backfilling link: {result['filename']} -> row {result['row']}")
                 continue
@@ -643,39 +445,46 @@ def process_batch(
             filename = result["filename"]
             content = result["content"]
             try:
-                file_id, link = upload_to_drive(drive_service, folder_id, filename, content)
+                link = upload_to_drive(drive_service, folder_id, filename, content)
                 with existing_lock:
-                    existing_files[filename] = {"link": link, "id": file_id}
+                    existing_files[filename] = link
                 link_updates.append((result["row"], link))
-                share_file_with_project_emails(drive_service, file_id)
                 print(f"Downloaded: {filename} -> row {result['row']}")
             except Exception as e:
                 print(f"Upload failed for {filename}: {e}")
 
-    # Write all Drive links for this batch back to the child sheet in one call.
+    # Write all Drive links for this batch back to column F in one call.
     try:
-        write_links_batch(sheets_service, child_sheet_id, child_sheet_name, link_updates)
+        write_links_batch(sheets_service, link_updates)
     except Exception as e:
-        print(f"Failed to write links back to child sheet {child_sheet_id}: {e}")
+        print(f"Failed to write links back to sheet: {e}")
 
 
-def process_child_sheet(
-    sheets_service, drive_service, folder_id, existing_files, existing_lock, child_sheet_id,
-):
-    """
-    Runs the full download/upload pipeline against a single child
-    spreadsheet until every pending row has been handled.
-    """
-    child_sheet_name = CONFIG["CHILD_SHEET_NAME"]
+# =========================================================
+# MAIN
+# =========================================================
+def main():
+    print("Authenticating...")
+    creds = get_credentials()
+    sheets_service = get_sheets_service(creds)
+    drive_service = get_drive_service(creds)
 
-    print(f"  Reading tokens from child sheet {child_sheet_id}...")
-    tokens = get_tokens(sheets_service, child_sheet_id)
-    print(f"  Loaded {len(tokens)} token(s).")
+    print("Reading tokens from Config sheet...")
+    tokens = get_tokens(sheets_service)
+    print(f"Loaded {len(tokens)} token(s).")
 
-    print(f"  Reading values from child sheet {child_sheet_id}...")
-    values = read_all_values(sheets_service, child_sheet_id, child_sheet_name)
+    print("Checking Drive folder access...")
+    verify_folder_access(drive_service, CONFIG["DRIVE_FOLDER_ID"])
+
+    print("Reading sheet values...")
+    values = read_all_values(sheets_service)
     request_list = build_request_list(values)
-    print(f"  Pending document URLs in child sheet: {len(request_list)}")
+    print(f"Total document URLs found (column E, pending): {len(request_list)}")
+
+    print("Preloading existing Drive files...")
+    existing_files = get_existing_files(drive_service, CONFIG["DRIVE_FOLDER_ID"])
+    existing_lock = threading.Lock()
+    print(f"Existing files already in folder: {len(existing_files)}")
 
     total = len(request_list)
     processed = 0
@@ -683,79 +492,17 @@ def process_child_sheet(
     while idx < total:
         chunk = request_list[idx: idx + CONFIG["REQUEST_BATCH_SIZE"]]
         process_batch(
-            chunk, tokens, drive_service, folder_id, existing_files, existing_lock,
-            sheets_service, child_sheet_id, child_sheet_name,
+            chunk, tokens, drive_service,
+            CONFIG["DRIVE_FOLDER_ID"], existing_files, existing_lock, sheets_service,
         )
 
         idx += len(chunk)
         processed += len(chunk)
-        print(f"  Progress: {processed}/{total}")
+        print(f"Progress: {processed}/{total}")
 
         time.sleep(CONFIG["SLEEP_BETWEEN_BATCHES"])
 
-    print(f"  Child sheet {child_sheet_id} completed. All rows processed.")
-
-
-# =========================================================
-# MAIN
-# =========================================================
-def main():
-    if not CONFIG["WORKER_USER"]:
-        raise ValueError("WORKER_USER env var must be set (name used to claim master rows).")
-
-    print("Authenticating...")
-    creds = get_credentials()
-    sheets_service = get_sheets_service(creds)
-    drive_service = get_drive_service(creds)
-
-    print("Checking Drive folder access...")
-    verify_folder_access(drive_service, CONFIG["DRIVE_FOLDER_ID"])
-
-    print("Preloading existing Drive files...")
-    existing_files = get_existing_files(drive_service, CONFIG["DRIVE_FOLDER_ID"])
-    existing_lock = threading.Lock()
-    print(f"Existing files already in folder: {len(existing_files)}")
-
-    master_sheet_id = CONFIG["MASTER_SHEET_ID"]
-    master_sheet_name = CONFIG["MASTER_SHEET_NAME"]
-
-    while True:
-        print("\nChecking master sheet for the next unclaimed row...")
-        master_values = read_all_values(sheets_service, master_sheet_id, master_sheet_name)
-        row, doc_link = find_next_unclaimed_master_row(master_values)
-
-        if row is None:
-            print("No unclaimed rows remain in the master sheet. Done.")
-            break
-
-        child_sheet_id = extract_sheet_id_from_url(doc_link)
-        if not child_sheet_id:
-            print(f"Row {row}: could not parse a spreadsheet id from Doc Link '{doc_link}'. Skipping claim.")
-            # Mark it so we don't loop on it forever, but don't call it "Done".
-            write_row_cells(
-                sheets_service, master_sheet_id, master_sheet_name, row,
-                {CONFIG["MASTER_STATUS_COL"]: "Invalid link"},
-            )
-            continue
-
-        print(f"Claiming master row {row} (child sheet {child_sheet_id}) as '{CONFIG['WORKER_USER']}'...")
-        claim_master_row(sheets_service, master_sheet_id, master_sheet_name, row)
-
-        try:
-            process_child_sheet(
-                sheets_service, drive_service, CONFIG["DRIVE_FOLDER_ID"],
-                existing_files, existing_lock, child_sheet_id,
-            )
-            mark_master_row_done(sheets_service, master_sheet_id, master_sheet_name, row)
-            print(f"Master row {row} marked Done.")
-        except Exception as e:
-            print(f"Error processing child sheet for master row {row}: {e}")
-            write_row_cells(
-                sheets_service, master_sheet_id, master_sheet_name, row,
-                {CONFIG["MASTER_STATUS_COL"]: "Error"},
-            )
-
-    print("\nAll available master rows have been processed.")
+    print("Completed. All rows processed.")
 
 
 if __name__ == "__main__":
