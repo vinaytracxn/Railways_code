@@ -31,9 +31,9 @@ CONFIG = {
     "DOC_URL_COLUMN": 5,           # E (1-indexed) - source document URL
     "DRIVE_LINK_COLUMN": 6,        # F (1-indexed) - resulting Drive link written back
 
-    "ROW_BATCH_SIZE": 100,
+    "ROW_BATCH_SIZE": 40,
     "REQUEST_BATCH_SIZE": 40,      # parallel requests per sub-batch
-    "MAX_WORKERS": 40,             # thread pool size for parallel fetches
+    "MAX_WORKERS": 20,             # thread pool size for parallel fetches
 
     "SLEEP_BETWEEN_BATCHES": 0.25,  # seconds
 
