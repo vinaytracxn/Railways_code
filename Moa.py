@@ -1,239 +1,248 @@
 import os
 import json
-import time
 import io
 import re
-import threading
-from datetime import datetime
-from urllib.parse import unquote, urlsplit
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
+import gc
+import json
+import time
+import string
 import requests
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
+import PyPDF2
+import gspread
 
-# =========================================================
-# CONFIG
-# =========================================================
-CONFIG = {
-    # SHEET_ID / SHEET_NAME are now resolved at runtime from the master
-    # "Sheet List" spreadsheet (see get_target_sheet_from_master below),
-    # so they start out empty and get filled in inside main().
-    "SHEET_ID": None,
-    "SHEET_NAME": None,
-    "SERVICE_ACCOUNT_FILE": os.environ.get("SERVICE_ACCOUNT_FILE"),
-    "DRIVE_FOLDER_ID": os.environ.get("DRIVE_FOLDER_ID"),
+try:
+    import pymupdf as fitz
+except ImportError:
+    import fitz
+import pytesseract
+from PIL import Image
 
-    # Master sheet that tracks which user is working on which target sheet.
-    # Header row: Doc Type | Sheet Link | User | Drive Link Status | extraction User | Extarction status
-    "MASTER_SHEET_ID": "1oNr3g2Pjpyu9u09w0lCFVT9vJwbBGn8O2rbx4kvjd88",
-    "MASTER_SHEET_TAB": "Sheet List",
-    "USER_NAME": os.environ.get("USER_NAME"),
+# Keep decompression-bomb protection ON (removed unlimited override) to avoid
+# unbounded memory allocation on malformed/huge PDF pages.
+Image.MAX_IMAGE_PIXELS = 200_000_000  # ~200MP safety ceiling instead of unlimited
 
-    # Column letters + 0-based row indices for the two tracking pairs on
-    # the master sheet. This script (Drive link population) tracks
-    # progress via "User" / "Drive Link Status" (C/D).
-    "MASTER_USER_COL_LETTER": "C",
-    "MASTER_USER_COL_IDX": 2,
-    "MASTER_STATUS_COL_LETTER": "D",
-    "MASTER_STATUS_COL_IDX": 3,
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from google.oauth2.service_account import Credentials
+import google.auth.transport.requests as google_requests
 
-    # The extraction phase tracks progress separately via
-    # "extraction User" / "Extarction status" (E/F).
-    "MASTER_EXTRACTION_USER_COL_LETTER": "E",
-    "MASTER_EXTRACTION_USER_COL_IDX": 4,
-    "MASTER_EXTRACTION_STATUS_COL_LETTER": "F",
-    "MASTER_EXTRACTION_STATUS_COL_IDX": 5,
+# ---------------- CONFIG (edit these directly for local runs) ----------------
 
-    "CONFIG_SHEET": "Config",      # sheet holding tokens in column B
+# Path to the downloaded Google service-account JSON key file.
+# Needs: Sheets API + Drive API enabled in its GCP project, edit access to
+# the target spreadsheet, and read access to whatever Drive files/folders
+# hold the PDFs referenced in the "Drive link" column (share those with the
+# service account's email, or use a shared drive).
+# GOOGLE_SERVICE_ACCOUNT_FILE = "/Users/vinay/Desktop/json/ss.json"
+#
+# # The Google Sheet to read/write.
+# INPUT_SPREADSHEET_ID = "1G55fLiITwFTI826GAHFJkxC8ve19vVKaiyH8B-aTjWk"
+# INPUT_SHEET_NAME = "Sheet1"
+#
+# # First data row to start processing from (row 1 is assumed to be the header).
+# START_ROW = 2
+# ---------------- Railway Configuration ----------------
 
-    "START_ROW": 2,                # 1-indexed, matches the sheet
+GOOGLE_SERVICE_ACCOUNT_INFO = json.loads(
+    os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+)
 
-    "DOC_URL_COLUMN": 5,           # E (1-indexed) - source document URL
-    "DRIVE_LINK_COLUMN": 6,        # F (1-indexed) - resulting Drive link written back
+# The sheet to process is no longer fixed by env vars -- it's picked up
+# dynamically from the master "Sheet List" spreadsheet (see MASTER_* below
+# and get_next_extraction_sheet()). Only USER_NAME needs to be set.
+USER_NAME = os.environ.get("USER_NAME")
 
-    "ROW_BATCH_SIZE": 40,
-    "REQUEST_BATCH_SIZE": 40,      # parallel requests per sub-batch
-    "MAX_WORKERS": 20,             # thread pool size for parallel fetches
+START_ROW = int(os.getenv("START_ROW", "2"))
 
-    "SLEEP_BETWEEN_BATCHES": 0.25,  # seconds
+# ---------------- Master sheet ("Sheet List") config ----------------
+# Header row: Doc Type | Sheet Link | User | Drive Link Status | extraction User | Extarction status
+MASTER_SHEET_ID = "1oNr3g2Pjpyu9u09w0lCFVT9vJwbBGn8O2rbx4kvjd88"
+MASTER_SHEET_TAB = "Sheet List"
 
-    "SKIP_ROWS_WITH_EXISTING_LINK": True,  # skip rows where col F is already filled
-}
+# This script tracks its own progress via the "extraction User" /
+# "Extarction status" columns (E/F), separately from the Drive-link phase
+# which uses "User" / "Drive Link Status" (C/D).
+MASTER_EXTRACTION_USER_COL_LETTER = "E"
+MASTER_EXTRACTION_USER_COL_IDX = 4
+MASTER_EXTRACTION_STATUS_COL_LETTER = "F"
+MASTER_EXTRACTION_STATUS_COL_IDX = 5
 
-SCOPES = [
+START_MARKERS = [
+    "MEMORANDUM OF ASSOCIATION OF A COMPANY LIMITED BY SHARES"
+]
+
+END_MARKERS = [
+    "Matters which are necessary for furtherance of the objects specified in clause",
+    "The furtherence of the object specified in clause",
+    "The Objects incidental or ancillary to the attainment of the above main objects",
+    "The Objects incidental or ancillary to the attainment of the main objects",
+    "Objects incidental or ancillary to the attainment of the main objects",
+    "Objects incidental and ancillary to the attainment of the main objects",
+    "Objects incidental to the attainment of the main objects",
+    "The other objects not included in objects",
+    "Objects and ancillary or",
+    "Objects, ancillary or",
+]
+
+# ---- Sheet header names (must match your header row exactly) ----
+CIN_HEADER = "CIN"
+LE_NAME_HEADER = "LE Name"
+DISPLAY_NAME_HEADER = "Display Name"
+DATE_HEADER = "Date"
+LINK_HEADER = "Link"                 # old Tracxn link column -- kept, not used for fetching
+DRIVE_LINK_HEADER = "Drive link"     # this is what we now fetch PDFs from
+EXTRACTION_HEADER = "extraction"
+STATUS_HEADER = "extraction_status"
+
+STATUS_CLAUSE_MATCHED = "clause 3a"
+STATUS_FULL_EXTRACT = "Full Extract"
+STATUS_NONE = ""
+STATUS_SKIPPED = "Skipped - Same CIN"
+STATUS_NO_LINK = "No Drive link"
+STATUS_BAD_LINK = "Could not parse Drive link"
+
+# ---- MEMORY / CONCURRENCY TUNING ----
+PREFETCH_WORKERS = 4
+EXTRACTION_WORKERS = 6
+INPUT_BATCH_SIZE = 40
+
+SHEETS_MAX_RETRIES = 5
+SHEETS_RETRY_BASE_DELAY = 5
+
+DRIVE_MAX_RETRIES = 4
+DRIVE_RETRY_BASE_DELAY = 3
+# -----------------------------------------
+
+DRIVE_SCOPES = [
+    "https://www.googleapis.com/auth/drive.readonly",
+]
+SHEETS_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
 
-# Thread-local storage so each worker thread reuses its own HTTP connection
-# pool instead of opening brand-new sockets/TLS handshakes for every request.
-_thread_local = threading.local()
 
-
-def get_session():
-    if not hasattr(_thread_local, "session"):
-        _thread_local.session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(
-            pool_connections=CONFIG["MAX_WORKERS"],
-            pool_maxsize=CONFIG["MAX_WORKERS"],
-        )
-        _thread_local.session.mount("http://", adapter)
-        _thread_local.session.mount("https://", adapter)
-    return _thread_local.session
-
-
-# =========================================================
-# AUTH / CLIENTS
-# =========================================================
-def get_credentials():
-    raw = CONFIG["SERVICE_ACCOUNT_FILE"].strip()
-
-    # If SERVICE_ACCOUNT_FILE holds the JSON key contents directly (starts
-    # with '{'), parse it as JSON instead of trying to open() it as a path.
-    if raw.startswith("{"):
+def call_with_retry(func, *args, **kwargs):
+    last_exc = None
+    for attempt in range(1, SHEETS_MAX_RETRIES + 1):
         try:
-            info = json.loads(raw)
-        except json.JSONDecodeError as e:
-            raise ValueError(
-                "SERVICE_ACCOUNT_FILE looks like JSON but failed to parse. "
-                "Make sure the full key file contents were pasted correctly."
-            ) from e
-        return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
-
-    # Otherwise treat it as a real path on disk.
-    return service_account.Credentials.from_service_account_file(raw, scopes=SCOPES)
-
-
-def get_sheets_service(creds):
-    return build("sheets", "v4", credentials=creds, cache_discovery=False)
-
-
-def get_drive_service(creds):
-    return build("drive", "v3", credentials=creds, cache_discovery=False)
+            return func(*args, **kwargs)
+        except (
+                requests.exceptions.RequestException,
+                OSError,
+                gspread.exceptions.APIError,
+        ) as e:
+            last_exc = e
+            if attempt == SHEETS_MAX_RETRIES:
+                break
+            delay = SHEETS_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+            print(f"  [retry] Sheets API call failed (attempt {attempt}/"
+                  f"{SHEETS_MAX_RETRIES}): {e}")
+            print(f"  [retry] Retrying in {delay}s...")
+            time.sleep(delay)
+    raise last_exc
 
 
-def get_tokens(sheets_service):
-    """Reads tokens from the Config sheet, column B, starting row 2."""
-    result = (
-        sheets_service.spreadsheets()
-        .values()
-        .get(
-            spreadsheetId=CONFIG["SHEET_ID"],
-            range=f"{CONFIG['CONFIG_SHEET']}!B2:B",
-        )
-        .execute()
-    )
-    rows = result.get("values", [])
-    tokens = [r[0] for r in rows if r and r[0]]
+# ---------------- AUTH ----------------
 
-    if not tokens:
-        raise ValueError("No tokens found in the Config sheet (column B).")
-
-    return tokens
+def gspread_auth():
+    creds = Credentials.from_service_account_info(GOOGLE_SERVICE_ACCOUNT_INFO, scopes=SHEETS_SCOPES)
+    return gspread.authorize(creds)
 
 
-def random_token(tokens):
-    import random
-    return random.choice(tokens)
+def drive_credentials():
+    """Separate Credentials object (readonly Drive scope) that we refresh
+    manually and reuse across threads for downloading file bytes."""
+    creds = Credentials.from_service_account_info(GOOGLE_SERVICE_ACCOUNT_INFO, scopes=DRIVE_SCOPES)
+    creds.refresh(google_requests.Request())
+    return creds
 
 
-# =========================================================
-# MASTER SHEET RESOLUTION
-# =========================================================
-def extract_sheet_id_and_gid(url):
+def drive_auth_header(creds: Credentials) -> dict:
+    # Refresh if close to/at expiry so long-running batches don't 401 midway.
+    if not creds.valid:
+        creds.refresh(google_requests.Request())
+    return {"Authorization": f"Bearer {creds.token}"}
+
+
+# ---------------- MASTER SHEET RESOLUTION ----------------
+
+_MASTER_LINK_ID_PATTERN = r"/spreadsheets/d/([a-zA-Z0-9-_]+)"
+_MASTER_LINK_GID_PATTERN = r"[#&]gid=(\d+)"
+
+
+def extract_sheet_id_and_gid(url: str):
     """Extracts (spreadsheet_id, gid) from a Google Sheets URL."""
-    id_match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url or "")
+    id_match = re.search(_MASTER_LINK_ID_PATTERN, url or "")
     sheet_id = id_match.group(1) if id_match else None
 
-    gid_match = re.search(r"[#&]gid=(\d+)", url or "")
+    gid_match = re.search(_MASTER_LINK_GID_PATTERN, url or "")
     gid = int(gid_match.group(1)) if gid_match else 0
 
     return sheet_id, gid
 
 
-def get_sheet_title_from_gid(sheets_service, spreadsheet_id, gid):
-    """Resolves a tab's title from its gid via spreadsheet metadata."""
-    meta = (
-        sheets_service.spreadsheets()
-        .get(spreadsheetId=spreadsheet_id, fields="sheets(properties(sheetId,title))")
-        .execute()
-    )
-    sheets_list = meta.get("sheets", [])
-    for sheet in sheets_list:
-        props = sheet.get("properties", {})
-        if props.get("sheetId") == gid:
-            return props.get("title")
+def get_sheet_title_from_gid(client, spreadsheet_id, gid) -> str:
+    """Resolves a tab's title from its gid by listing worksheets."""
+    spreadsheet = call_with_retry(client.open_by_key, spreadsheet_id)
+    worksheets = call_with_retry(spreadsheet.worksheets)
+    for ws in worksheets:
+        if ws.id == gid:
+            return ws.title
 
     # Fallback: gid wasn't found (e.g. link had no #gid=), use the first tab.
-    if sheets_list:
-        return sheets_list[0]["properties"]["title"]
+    if worksheets:
+        return worksheets[0].title
 
     raise ValueError(f"No tabs found in spreadsheet {spreadsheet_id}")
 
 
-def set_master_row(sheets_service, row_number, user_col, status_col, user_name=None, status=None):
-    """
-    Writes to a master 'Sheet List' row: the given user column letter and/or
-    status column letter. Pass only the fields you want to update.
-    """
+def get_master_worksheet(client):
+    spreadsheet = call_with_retry(client.open_by_key, MASTER_SHEET_ID)
+    return call_with_retry(spreadsheet.worksheet, MASTER_SHEET_TAB)
+
+
+def set_master_row(client, row_number, user_col=None, status_col=None, user_name=None, status=None):
+    """Writes to a master 'Sheet List' row: the given user/status column
+    letters. Pass only the fields you want to update."""
     data = []
-    if user_name is not None:
-        data.append(
-            {"range": f"{CONFIG['MASTER_SHEET_TAB']}!{user_col}{row_number}", "values": [[user_name]]}
-        )
-    if status is not None:
-        data.append(
-            {"range": f"{CONFIG['MASTER_SHEET_TAB']}!{status_col}{row_number}", "values": [[status]]}
-        )
+    if user_name is not None and user_col is not None:
+        data.append({"range": f"{user_col}{row_number}", "values": [[user_name]]})
+    if status is not None and status_col is not None:
+        data.append({"range": f"{status_col}{row_number}", "values": [[status]]})
     if not data:
         return
 
-    body = {"valueInputOption": "USER_ENTERED", "data": data}
-    sheets_service.spreadsheets().values().batchUpdate(
-        spreadsheetId=CONFIG["MASTER_SHEET_ID"], body=body
-    ).execute()
+    ws = get_master_worksheet(client)
+    call_with_retry(ws.batch_update, data)
 
 
-def mark_master_row_done(sheets_service, row_number, status_col):
+def mark_master_row_done(client, row_number, status_col):
     """Marks a master-sheet row's status column as 'Done' once processing finishes."""
-    set_master_row(sheets_service, row_number, user_col=None, status_col=status_col, status="Done")
-    print(f"Marked master row {row_number} (col {status_col}) as Done.")
+    set_master_row(client, row_number, status_col=status_col, status="Done")
+    print(f"  [master] Marked master row {row_number} (col {status_col}) as Done.")
 
 
-def get_target_sheet_from_master(sheets_service, user_name, user_col_idx, status_col_idx, user_col_letter, status_col_letter):
+def get_target_sheet_from_master(client, user_name, user_col_idx, status_col_idx,
+                                  user_col_letter, status_col_letter):
     """
     Reads the master 'Sheet List' tab (Doc Type | Sheet Link | User |
     Drive Link Status | extraction User | Extarction status) and picks a
-    sheet to work on, tracking progress via the given user/status columns
-    (0-based indices into each row, plus their sheet column letters for
-    writing back).
+    sheet to work on, tracking progress via the given user/status columns.
 
     1) If a row already has this user in the user column with the status
        column == 'processing', resume that sheet.
     2) Otherwise, claim the first row with an empty user column: write
        user_name into it and 'Processing' into the status column, then use
        that row's sheet.
-    3) If neither exists (no in-progress row for this user, and no
-       unclaimed row available), return None -- callers use this to know
-       there are no more sheets left to pick up.
+    3) If neither exists, return None -- no more sheets left to pick up.
 
     Returns (spreadsheet_id, sheet_title, master_row_number), or None.
     """
     if not user_name:
         raise ValueError("USER_NAME environment variable is not set.")
 
-    result = (
-        sheets_service.spreadsheets()
-        .values()
-        .get(
-            spreadsheetId=CONFIG["MASTER_SHEET_ID"],
-            range=f"{CONFIG['MASTER_SHEET_TAB']}!A2:F",
-        )
-        .execute()
-    )
-    rows = result.get("values", [])
+    ws = get_master_worksheet(client)
+    rows = call_with_retry(ws.get, "A2:F")
 
     unclaimed_row_number = None
 
@@ -249,12 +258,10 @@ def get_target_sheet_from_master(sheets_service, user_name, user_col_idx, status
         ):
             spreadsheet_id, gid = extract_sheet_id_and_gid(sheet_link)
             if not spreadsheet_id:
-                raise ValueError(
-                    f"Could not parse a spreadsheet ID from Sheet Link: {sheet_link}"
-                )
-            sheet_title = get_sheet_title_from_gid(sheets_service, spreadsheet_id, gid)
+                raise ValueError(f"Could not parse a spreadsheet ID from Sheet Link: {sheet_link}")
+            sheet_title = get_sheet_title_from_gid(client, spreadsheet_id, gid)
             print(
-                f"Found in-progress sheet for user '{user_name}': "
+                f"  [master] Found in-progress sheet for user '{user_name}': "
                 f"{sheet_link} -> tab '{sheet_title}' (master row {master_row_number})"
             )
             return spreadsheet_id, sheet_title, master_row_number
@@ -267,455 +274,489 @@ def get_target_sheet_from_master(sheets_service, user_name, user_col_idx, status
         sheet_link = row[1] if len(row) > 1 else ""
         spreadsheet_id, gid = extract_sheet_id_and_gid(sheet_link)
         if not spreadsheet_id:
-            raise ValueError(
-                f"Could not parse a spreadsheet ID from Sheet Link: {sheet_link}"
-            )
-        sheet_title = get_sheet_title_from_gid(sheets_service, spreadsheet_id, gid)
+            raise ValueError(f"Could not parse a spreadsheet ID from Sheet Link: {sheet_link}")
+        sheet_title = get_sheet_title_from_gid(client, spreadsheet_id, gid)
 
         set_master_row(
-            sheets_service, unclaimed_row_number,
+            client, unclaimed_row_number,
             user_col=user_col_letter, status_col=status_col_letter,
             user_name=user_name, status="Processing",
         )
         print(
-            f"Assigned unclaimed master row {unclaimed_row_number} to user '{user_name}': "
-            f"{sheet_link} -> tab '{sheet_title}'"
+            f"  [master] Assigned unclaimed master row {unclaimed_row_number} to user "
+            f"'{user_name}': {sheet_link} -> tab '{sheet_title}'"
         )
         return spreadsheet_id, sheet_title, unclaimed_row_number
 
     return None
 
 
-def get_next_drive_link_sheet(sheets_service, user_name):
-    """Picks/resumes a sheet tracked via the 'User' / 'Drive Link Status' columns (C/D)."""
+def get_next_extraction_sheet(client, user_name):
+    """Picks/resumes a sheet tracked via 'extraction User' / 'Extarction status' (E/F)."""
     return get_target_sheet_from_master(
-        sheets_service, user_name,
-        user_col_idx=CONFIG["MASTER_USER_COL_IDX"],
-        status_col_idx=CONFIG["MASTER_STATUS_COL_IDX"],
-        user_col_letter=CONFIG["MASTER_USER_COL_LETTER"],
-        status_col_letter=CONFIG["MASTER_STATUS_COL_LETTER"],
+        client, user_name,
+        user_col_idx=MASTER_EXTRACTION_USER_COL_IDX,
+        status_col_idx=MASTER_EXTRACTION_STATUS_COL_IDX,
+        user_col_letter=MASTER_EXTRACTION_USER_COL_LETTER,
+        status_col_letter=MASTER_EXTRACTION_STATUS_COL_LETTER,
     )
 
 
-def get_next_extraction_sheet(sheets_service, user_name):
-    """Picks/resumes a sheet tracked via the 'extraction User' / 'Extarction status' columns (E/F)."""
-    return get_target_sheet_from_master(
-        sheets_service, user_name,
-        user_col_idx=CONFIG["MASTER_EXTRACTION_USER_COL_IDX"],
-        status_col_idx=CONFIG["MASTER_EXTRACTION_STATUS_COL_IDX"],
-        user_col_letter=CONFIG["MASTER_EXTRACTION_USER_COL_LETTER"],
-        status_col_letter=CONFIG["MASTER_EXTRACTION_STATUS_COL_LETTER"],
+# ---------------- DRIVE FILE FETCHING ----------------
+
+_DRIVE_ID_PATTERNS = [
+    r"/file/d/([a-zA-Z0-9_-]{10,})",   # https://drive.google.com/file/d/<ID>/view
+    r"[?&]id=([a-zA-Z0-9_-]{10,})",    # https://drive.google.com/open?id=<ID> or uc?id=<ID>
+    r"/document/d/([a-zA-Z0-9_-]{10,})",
+    r"/uc\?export=download&id=([a-zA-Z0-9_-]{10,})",
+]
+
+
+def extract_drive_file_id(link: str) -> str:
+    """Pulls the Drive file ID out of any common Google Drive share-link
+    format. Falls back to treating the whole string as an ID if it already
+    looks like a bare ID (no slashes/scheme)."""
+    if not link:
+        return ""
+    for pattern in _DRIVE_ID_PATTERNS:
+        match = re.search(pattern, link)
+        if match:
+            return match.group(1)
+    if "/" not in link and "://" not in link:
+        return link.strip()
+    return ""
+
+
+def download_drive_file_bytes(creds: Credentials, file_id: str) -> bytes:
+    url = f"https://www.googleapis.com/drive/v3/files/{file_id}"
+    params = {"alt": "media", "supportsAllDrives": "true"}
+
+    last_exc = None
+    for attempt in range(1, DRIVE_MAX_RETRIES + 1):
+        try:
+            response = requests.get(
+                url, headers=drive_auth_header(creds), params=params, timeout=60
+            )
+            response.raise_for_status()
+            return response.content
+        except requests.exceptions.RequestException as e:
+            last_exc = e
+            if attempt == DRIVE_MAX_RETRIES:
+                raise
+            time.sleep(DRIVE_RETRY_BASE_DELAY * (2 ** (attempt - 1)))
+    raise last_exc
+
+
+def prefetch_drive_files(creds: Credentials, links: list) -> dict:
+    """Downloads bytes for each distinct Drive link in parallel.
+    Returns {link: bytes} -- links that fail to parse/download are omitted."""
+    results = {}
+    if not links:
+        return results
+
+    def _fetch_one(link):
+        file_id = extract_drive_file_id(link)
+        if not file_id:
+            print(f"  [drive] Could not parse a file ID from link: {link}")
+            return link, None
+        try:
+            return link, download_drive_file_bytes(creds, file_id)
+        except Exception as e:
+            print(f"  [drive] Download failed for {link} (file_id={file_id}): {e}")
+            return link, None
+
+    with ThreadPoolExecutor(max_workers=PREFETCH_WORKERS) as executor:
+        futures = [executor.submit(_fetch_one, link) for link in links]
+        for future in as_completed(futures):
+            link, pdf_bytes = future.result()
+            if pdf_bytes is not None:
+                results[link] = pdf_bytes
+
+    return results
+
+
+# ---------------- PDF TEXT EXTRACTION ----------------
+
+PLACEHOLDER_SIGNATURE = "If this message is not eventually replaced by the proper contents"
+MIN_TEXT_CHARS_FOR_TEXT_PDF = 30
+MAX_CELL_CHARS = 49500
+TRUNCATION_SUFFIX = " ...[TRUNCATED -- exceeded Google Sheets 50,000 char cell limit]"
+
+
+def truncate_for_sheet_cell(text: str) -> str:
+    if len(text) <= MAX_CELL_CHARS:
+        return text
+    cutoff = MAX_CELL_CHARS - len(TRUNCATION_SUFFIX)
+    return text[:cutoff] + TRUNCATION_SUFFIX
+
+
+def is_unsupported_xfa_placeholder(text: str) -> bool:
+    return PLACEHOLDER_SIGNATURE.lower() in text.lower()
+
+
+def is_scanned_photo_pdf(text: str) -> bool:
+    non_whitespace_chars = len(re.sub(r"\s+", "", text))
+    return non_whitespace_chars < MIN_TEXT_CHARS_FOR_TEXT_PDF
+
+
+# ---------------- OCR FALLBACK ----------------
+
+OCR_DPI = 200
+OCR_LANGUAGE = "eng"
+
+
+def ocr_pdf_bytes(pdf_bytes: bytes) -> str:
+    text_parts = []
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        zoom = OCR_DPI / 72
+        matrix = fitz.Matrix(zoom, zoom)
+        for page in doc:
+            pix = page.get_pixmap(matrix=matrix, colorspace=fitz.csGRAY)
+            img = Image.open(io.BytesIO(pix.tobytes("png")))
+            try:
+                page_text = pytesseract.image_to_string(img, lang=OCR_LANGUAGE)
+            finally:
+                img.close()
+            text_parts.append(page_text)
+            pix = None
+    finally:
+        doc.close()
+    return "\n".join(text_parts)
+
+
+def extract_pdf_text(pdf_file: io.BytesIO) -> str:
+    reader = PyPDF2.PdfReader(pdf_file, strict=False)
+    text = ""
+    for page in reader.pages:
+        try:
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n"
+        except Exception:
+            pass
+    return text
+
+
+def extract_main_objects(text: str) -> str:
+    def to_flexible_pattern(marker: str) -> str:
+        return r"\s+".join(re.escape(word) for word in marker.split())
+
+    start_alternation = "|".join(to_flexible_pattern(m) for m in START_MARKERS)
+    end_alternation = "|".join(to_flexible_pattern(m) for m in END_MARKERS)
+
+    pattern = re.compile(
+        rf"(?:{start_alternation})\s*(.*?)\s*(?:{end_alternation})",
+        re.IGNORECASE | re.DOTALL,
     )
+    match = pattern.search(text)
+    if not match:
+        return ""
+    return re.sub(r"\s+", " ", match.group(1)).strip()
 
 
-# =========================================================
-# SHEET READING
-# =========================================================
-def read_all_values(sheets_service):
-    result = (
-        sheets_service.spreadsheets()
-        .values()
-        .get(spreadsheetId=CONFIG["SHEET_ID"], range=CONFIG["SHEET_NAME"])
-        .execute()
-    )
-    return result.get("values", [])
+def build_extraction_result(raw_text: str) -> tuple:
+    objects_text = extract_main_objects(raw_text)
+    if objects_text:
+        return objects_text, STATUS_CLAUSE_MATCHED
+
+    full_text = re.sub(r"\s+", " ", raw_text).strip()
+    return full_text, STATUS_FULL_EXTRACT
 
 
-def build_request_list(values):
-    """
-    values is 0-indexed (row 0 = sheet row 1).
-    Only column E (DOC_URL_COLUMN) is read per row. Rows that already have
-    a Drive link in column F are skipped (if SKIP_ROWS_WITH_EXISTING_LINK) --
-    this is what makes the run resume from the first unprocessed row.
-    """
-    requests_list = []
-    start_row = CONFIG["START_ROW"]
-    doc_col = CONFIG["DOC_URL_COLUMN"]
-    link_col = CONFIG["DRIVE_LINK_COLUMN"]
+def extract_doc_text(pdf_bytes: bytes) -> tuple:
+    pdf_text = extract_pdf_text(io.BytesIO(pdf_bytes))
 
-    for row_index, row in enumerate(values):
-        sheet_row = row_index + 1  # 1-indexed sheet row
-        if sheet_row < start_row:
-            continue
+    if is_unsupported_xfa_placeholder(pdf_text):
+        return "Content not available", STATUS_NONE
 
-        url = row[doc_col - 1] if doc_col - 1 < len(row) else None
-        if not url:
-            continue
+    if is_scanned_photo_pdf(pdf_text):
+        try:
+            ocr_text = ocr_pdf_bytes(pdf_bytes)
+        except Exception:
+            return "Photo pdf", STATUS_NONE
 
-        if CONFIG["SKIP_ROWS_WITH_EXISTING_LINK"]:
-            existing_link = row[link_col - 1] if link_col - 1 < len(row) else None
-            if existing_link:
-                continue
+        if is_scanned_photo_pdf(ocr_text):
+            return "Photo pdf", STATUS_NONE
+        return build_extraction_result(ocr_text)
 
-        requests_list.append({"row": sheet_row, "col": doc_col, "url": url})
-
-    return requests_list
+    return build_extraction_result(pdf_text)
 
 
-# =========================================================
-# SHEET WRITING (Drive link back to column F)
-# =========================================================
-def col_num_to_letter(n):
+# ---------------- UTILS ----------------
+
+def parse_header(header_row):
+    indices = {}
+    for i, col in enumerate(header_row):
+        name = col.strip()
+        if name == CIN_HEADER and CIN_HEADER not in indices:
+            indices[CIN_HEADER] = i
+        elif name == LE_NAME_HEADER and LE_NAME_HEADER not in indices:
+            indices[LE_NAME_HEADER] = i
+        elif name == DISPLAY_NAME_HEADER and DISPLAY_NAME_HEADER not in indices:
+            indices[DISPLAY_NAME_HEADER] = i
+        elif name == DATE_HEADER and DATE_HEADER not in indices:
+            indices[DATE_HEADER] = i
+        elif name == LINK_HEADER and LINK_HEADER not in indices:
+            indices[LINK_HEADER] = i
+        elif name == DRIVE_LINK_HEADER and DRIVE_LINK_HEADER not in indices:
+            indices[DRIVE_LINK_HEADER] = i
+        elif name == EXTRACTION_HEADER and EXTRACTION_HEADER not in indices:
+            indices[EXTRACTION_HEADER] = i
+        elif name == STATUS_HEADER and STATUS_HEADER not in indices:
+            indices[STATUS_HEADER] = i
+
+    required = [CIN_HEADER, DRIVE_LINK_HEADER, EXTRACTION_HEADER, STATUS_HEADER]
+    missing = [h for h in required if h not in indices]
+    if missing:
+        raise ValueError(f"Could not find column(s) {missing} in header row.")
+    return indices
+
+
+def safe_get(row, idx):
+    return row[idx].strip() if idx is not None and idx < len(row) and row[idx] else ""
+
+
+def col_num_to_letter(n: int) -> str:
     letters = ""
     while n > 0:
         n, remainder = divmod(n - 1, 26)
-        letters = chr(65 + remainder) + letters
+        letters = string.ascii_uppercase[remainder] + letters
     return letters
 
 
-def write_links_batch(sheets_service, link_updates):
-    """
-    link_updates: list of (row, link) tuples.
-    Writes each link to column F of its respective row in one batchUpdate call.
-    """
-    if not link_updates:
+def write_column_values(input_sheet, batch_start, batch_end, col_idx,
+                        chunk_rows, new_values_by_row, label):
+    col_letter = col_num_to_letter(col_idx + 1)
+    values = []
+    for offset, sheet_row in enumerate(range(batch_start, batch_end + 1)):
+        if sheet_row in new_values_by_row:
+            values.append([new_values_by_row[sheet_row]])
+        else:
+            existing = safe_get(chunk_rows[offset], col_idx) if offset < len(chunk_rows) else ""
+            values.append([existing])
+
+    range_name = f"{col_letter}{batch_start}:{col_letter}{batch_end}"
+    call_with_retry(
+        input_sheet.update,
+        range_name=range_name, values=values, value_input_option="RAW",
+    )
+    print(f"  --> Wrote {len(new_values_by_row)} {label} result(s) to column {col_letter} ({batch_start}-{batch_end})")
+
+
+# ---------------- MAIN ----------------
+
+def process_sheet(client, drive_creds, spreadsheet_id, sheet_name, master_row):
+    """Runs the full extraction pass for one sheet, then marks its master
+    row Done via the extraction status column."""
+    spreadsheet = call_with_retry(client.open_by_key, spreadsheet_id)
+    input_sheet = call_with_retry(spreadsheet.worksheet, sheet_name)
+
+    header_row = call_with_retry(input_sheet.row_values, 1)
+    if not header_row:
+        print("Input sheet has no header row.")
         return
 
-    link_col_letter = col_num_to_letter(CONFIG["DRIVE_LINK_COLUMN"])
-    data = [
-        {
-            "range": f"{CONFIG['SHEET_NAME']}!{link_col_letter}{row}",
-            "values": [[link]],
-        }
-        for row, link in link_updates
-    ]
+    indices = parse_header(header_row)
+    cin_idx = indices[CIN_HEADER]
+    drive_link_idx = indices[DRIVE_LINK_HEADER]
+    extraction_idx = indices[EXTRACTION_HEADER]
+    status_idx = indices[STATUS_HEADER]
 
-    body = {"valueInputOption": "USER_ENTERED", "data": data}
-    sheets_service.spreadsheets().values().batchUpdate(
-        spreadsheetId=CONFIG["SHEET_ID"], body=body
-    ).execute()
+    last_col_letter = col_num_to_letter(max(indices.values()) + 1)
+    total_rows_in_sheet = input_sheet.row_count
 
-
-# =========================================================
-# DRIVE HELPERS
-# =========================================================
-def verify_folder_access(drive_service, folder_id):
-    """
-    Fails fast with a clear message instead of letting every upload 404.
-    A 404 here almost always means either:
-      1) the folder ID is wrong, or
-      2) the folder hasn't been shared with the service account's email, or
-      3) the folder lives in a Shared Drive (needs supportsAllDrives).
-    """
+    # Pre-scan the sheet to build a set of CINs that ALREADY have clause 3a
+    successful_cins = set()
+    print("Pre-scanning sheet to map already successful CINs...")
     try:
-        folder = (
-            drive_service.files()
-            .get(fileId=folder_id, fields="id, name, driveId", supportsAllDrives=True)
-            .execute()
-        )
-        print(f"Drive folder OK: '{folder.get('name')}' (id: {folder.get('id')})")
+        all_cins = call_with_retry(input_sheet.col_values, cin_idx + 1)
+        all_statuses = call_with_retry(input_sheet.col_values, status_idx + 1)
+        for c, s in zip(all_cins[1:], all_statuses[1:]):  # skip header
+            if s.strip() == STATUS_CLAUSE_MATCHED:
+                successful_cins.add(c.strip())
+        print(f"Found {len(successful_cins)} CINs that already have '{STATUS_CLAUSE_MATCHED}'.")
+        del all_cins, all_statuses
     except Exception as e:
-        sa_email = "?"
-        try:
-            raw = CONFIG["SERVICE_ACCOUNT_FILE"].strip()
-            if raw.startswith("{"):
-                sa_email = json.loads(raw).get("client_email", "?")
-            else:
-                with open(raw, "r") as f:
-                    sa_email = json.load(f).get("client_email", "?")
-        except Exception:
-            pass
-        raise RuntimeError(
-            f"Cannot access Drive folder '{folder_id}': {e}\n\n"
-            f"Fix: open the folder in Drive, click Share, and add this "
-            f"service account as an Editor:\n    {sa_email}\n"
-            f"If the folder lives inside a Shared Drive, add the service "
-            f"account as a member of that Shared Drive instead."
-        )
+        print(f"Warning: Initial status pre-scan failed ({e}). Proceeding without seeding memory.")
 
+    current_row = START_ROW
+    print(f"\n--- Starting processing from row {START_ROW} ---")
 
-def get_existing_files(drive_service, folder_id):
-    """
-    Preload existing files in the target folder as a {filename: driveLink}
-    map. This lets us both (a) avoid re-downloading files that already
-    exist, and (b) backfill column F for rows whose file already exists
-    but whose sheet row was never marked with a link.
-    """
-    files = {}
-    page_token = None
-    query = f"'{folder_id}' in parents and trashed = false"
+    while current_row <= total_rows_in_sheet:
+        # Scoped per-batch so extracted text for previous batches is freed.
+        extracted_result_cache = {}  # drive_link -> (extract_text, status_value)
 
-    while True:
-        resp = (
-            drive_service.files()
-            .list(
-                q=query,
-                fields="nextPageToken, files(id, name, webViewLink)",
-                pageSize=1000,
-                pageToken=page_token,
-                supportsAllDrives=True,
-                includeItemsFromAllDrives=True,
-                corpora="allDrives",
-            )
-            .execute()
-        )
-        for f in resp.get("files", []):
-            link = f.get("webViewLink") or f"https://drive.google.com/file/d/{f['id']}/view"
-            files[f["name"]] = link
-        page_token = resp.get("nextPageToken")
-        if not page_token:
+        batch_start = current_row
+        batch_end = min(current_row + INPUT_BATCH_SIZE - 1, total_rows_in_sheet)
+
+        range_name = f"A{batch_start}:{last_col_letter}{batch_end}"
+        chunk_rows = call_with_retry(input_sheet.get, range_name)
+
+        if not chunk_rows:
             break
 
-    return files
+        print(f"\n=== Batch: input rows {batch_start}-{batch_end} ({len(chunk_rows)} fetched) ===")
 
+        row_infos = []  # (sheet_row_number, cin, drive_link)
+        rows_to_skip = []  # (sheet_row_number, cin) -> to be written as "Skipped"
+        unique_links = set()
+        any_data_in_chunk = False
+        skipped_already_processed = 0
+        skipped_no_link = 0
 
-def upload_to_drive(drive_service, folder_id, filename, content_bytes):
-    """Uploads the PDF and returns its Drive webViewLink (shareable link)."""
-    media = MediaIoBaseUpload(
-        io.BytesIO(content_bytes), mimetype="application/pdf", resumable=False
-    )
-    file_metadata = {"name": filename, "parents": [folder_id]}
-    created = (
-        drive_service.files()
-        .create(
-            body=file_metadata,
-            media_body=media,
-            fields="id, webViewLink",
-            supportsAllDrives=True,
-        )
-        .execute()
-    )
+        for offset, row in enumerate(chunk_rows):
+            sheet_row_number = batch_start + offset
+            cin = safe_get(row, cin_idx)
+            if not cin:
+                continue
+            any_data_in_chunk = True
 
-    link = created.get("webViewLink")
-    if not link:
-        # Fallback: construct the standard viewer link from the file id.
-        link = f"https://drive.google.com/file/d/{created['id']}/view"
-    return link
+            status_val = safe_get(row, status_idx)
+            extracted_val = safe_get(row, extraction_idx)
 
-
-# =========================================================
-# FILENAME RESOLUTION
-# =========================================================
-def filename_from_url(signed_url):
-    """Cheap, network-free filename guess derived purely from the URL path."""
-    try:
-        path = urlsplit(signed_url).path
-        filename = unquote(path.rsplit("/", 1)[-1])
-        if filename:
-            return filename
-    except Exception:
-        pass
-    return None
-
-
-def filename_from_headers(headers):
-    disposition = headers.get("content-disposition", "") or headers.get(
-        "Content-Disposition", ""
-    )
-    match = re.search(r'filename="?([^"]+)"?', disposition, re.IGNORECASE)
-    if match:
-        return match.group(1)
-    return None
-
-
-def fallback_filename():
-    return f"Document_{int(datetime.now().timestamp() * 1000)}.pdf"
-
-
-# =========================================================
-# PER-ITEM PROCESSING
-# =========================================================
-def resolve_signed_url(item, token):
-    """First request: get the redirect (Location header) signed URL."""
-    try:
-        resp = get_session().get(
-            item["url"],
-            headers={"accessToken": token},
-            allow_redirects=False,
-            timeout=30,
-        )
-        signed_url = resp.headers.get("Location") or resp.headers.get("location")
-        if not signed_url:
-            print(f"No signed URL for row {item['row']} col {item['col']}: {item['url']}")
-            return None
-        return signed_url
-    except Exception as e:
-        print(f"Error resolving signed URL for row {item['row']}: {e}")
-        return None
-
-
-def download_pdf(signed_url):
-    """Second request: download the actual PDF bytes (only when needed)."""
-    try:
-        resp = get_session().get(signed_url, timeout=60)
-        if resp.status_code != 200:
-            print(f"Download failed ({resp.status_code}) for {signed_url}")
-            return None, None
-        return resp.content, resp.headers
-    except Exception as e:
-        print(f"Error downloading {signed_url}: {e}")
-        return None, None
-
-
-def process_item(item, tokens, existing_files, existing_lock):
-    """
-    Runs the resolve + (maybe) download steps for a single row.
-
-    Returns a dict:
-      {"row": row, "status": "existing", "filename": name, "link": link}
-        -> file already in Drive; caller just needs to write the link back.
-      {"row": row, "status": "uploaded", "filename": name, "content": bytes}
-        -> new file, caller must upload it.
-      None -> nothing usable (resolve/download failure).
-    """
-    token = random_token(tokens)
-    signed_url = resolve_signed_url(item, token)
-    if not signed_url:
-        return None
-
-    # Cheap, network-free filename guess first -- lets us skip the (large)
-    # PDF download entirely if the file is already sitting in Drive.
-    guessed_name = filename_from_url(signed_url)
-    if guessed_name:
-        with existing_lock:
-            existing_link = existing_files.get(guessed_name)
-        if existing_link:
-            return {
-                "row": item["row"],
-                "status": "existing",
-                "filename": guessed_name,
-                "link": existing_link,
-            }
-
-    content, headers = download_pdf(signed_url)
-    if content is None:
-        return None
-
-    filename = guessed_name or filename_from_headers(headers or {}) or fallback_filename()
-
-    # Re-check in case another thread just uploaded the same filename.
-    with existing_lock:
-        existing_link = existing_files.get(filename)
-    if existing_link:
-        return {
-            "row": item["row"],
-            "status": "existing",
-            "filename": filename,
-            "link": existing_link,
-        }
-
-    return {
-        "row": item["row"],
-        "status": "uploaded",
-        "filename": filename,
-        "content": content,
-    }
-
-
-# =========================================================
-# BATCH PROCESSING
-# =========================================================
-def process_batch(batch, tokens, drive_service, folder_id, existing_files, existing_lock, sheets_service):
-    link_updates = []  # (row, link) to write back to column F
-
-    with ThreadPoolExecutor(max_workers=CONFIG["MAX_WORKERS"]) as pool:
-        futures = {
-            pool.submit(process_item, item, tokens, existing_files, existing_lock): item
-            for item in batch
-        }
-
-        for future in as_completed(futures):
-            item = futures[future]
-            try:
-                result = future.result()
-            except Exception as e:
-                print(f"Unhandled error for row {item['row']}: {e}")
+            # If this row is the one that succeeded, add its CIN to our skip list
+            if status_val == STATUS_CLAUSE_MATCHED:
+                successful_cins.add(cin)
+                skipped_already_processed += 1
                 continue
 
-            if not result:
+            # If we already have a success for this CIN, skip this row entirely
+            if cin in successful_cins:
+                if extracted_val != "Skipped":
+                    rows_to_skip.append((sheet_row_number, cin))
+                else:
+                    skipped_already_processed += 1
                 continue
 
-            if result["status"] == "existing":
-                # File already lives in Drive -- backfill column F, no
-                # re-upload needed. This is exactly the "unprocessed row"
-                # case: existing file, empty column F.
-                link_updates.append((result["row"], result["link"]))
-                print(f"Already in Drive, backfilling link: {result['filename']} -> row {result['row']}")
+            if bool(extracted_val):
+                skipped_already_processed += 1
                 continue
 
-            # status == "uploaded"
-            filename = result["filename"]
-            content = result["content"]
-            try:
-                link = upload_to_drive(drive_service, folder_id, filename, content)
-                with existing_lock:
-                    existing_files[filename] = link
-                link_updates.append((result["row"], link))
-                print(f"Downloaded: {filename} -> row {result['row']}")
-            except Exception as e:
-                print(f"Upload failed for {filename}: {e}")
+            drive_link = safe_get(row, drive_link_idx)
+            if not drive_link:
+                skipped_no_link += 1
+                continue
 
-    # Write all Drive links for this batch back to column F in one call.
-    try:
-        write_links_batch(sheets_service, link_updates)
-    except Exception as e:
-        print(f"Failed to write links back to sheet: {e}")
+            row_infos.append((sheet_row_number, cin, drive_link))
+            unique_links.add(drive_link)
 
+        if not any_data_in_chunk:
+            print("  No CIN values found in this batch -- stopping.")
+            break
 
-# =========================================================
-# MAIN
-# =========================================================
-def process_one_sheet(sheets_service, drive_service, master_row):
-    """Runs the full download/upload pass for whichever sheet is currently
-    set in CONFIG['SHEET_ID'] / CONFIG['SHEET_NAME'], then marks the
-    master row Done via the extraction status column."""
-    print("Reading tokens from Config sheet...")
-    tokens = get_tokens(sheets_service)
-    print(f"Loaded {len(tokens)} token(s).")
+        if skipped_already_processed:
+            print(f"  Skipping {skipped_already_processed} row(s) already processed.")
+        if rows_to_skip:
+            print(f"  Skipping {len(rows_to_skip)} row(s) because their CIN already has clause 3a.")
+        if skipped_no_link:
+            print(f"  Skipping {skipped_no_link} row(s) with no Drive link value.")
 
-    print("Checking Drive folder access...")
-    verify_folder_access(drive_service, CONFIG["DRIVE_FOLDER_ID"])
+        if not row_infos and not rows_to_skip:
+            print("  Nothing new to process or mark in this batch.")
+            current_row = batch_end + 1
+            del chunk_rows, row_infos, rows_to_skip, unique_links, extracted_result_cache
+            gc.collect()
+            continue
 
-    print("Reading sheet values...")
-    values = read_all_values(sheets_service)
-    request_list = build_request_list(values)
-    print(f"Total document URLs found (column E, pending): {len(request_list)}")
+        # PREFETCH & EXTRACT
+        if unique_links:
+            prefetch_cache = prefetch_drive_files(drive_creds, unique_links)
 
-    print("Preloading existing Drive files...")
-    existing_files = get_existing_files(drive_service, CONFIG["DRIVE_FOLDER_ID"])
-    existing_lock = threading.Lock()
-    print(f"Existing files already in folder: {len(existing_files)}")
+            unresolved_links = unique_links - set(prefetch_cache.keys())
+            for link in unresolved_links:
+                extracted_result_cache[link] = (
+                    STATUS_BAD_LINK if not extract_drive_file_id(link) else "Content not available",
+                    STATUS_NONE,
+                )
 
-    total = len(request_list)
-    processed = 0
-    idx = 0
-    while idx < total:
-        chunk = request_list[idx: idx + CONFIG["REQUEST_BATCH_SIZE"]]
-        process_batch(
-            chunk, tokens, drive_service,
-            CONFIG["DRIVE_FOLDER_ID"], existing_files, existing_lock, sheets_service,
+            docs_to_extract = sorted(link for link in prefetch_cache.keys())
+
+            if docs_to_extract:
+                with ThreadPoolExecutor(max_workers=EXTRACTION_WORKERS) as executor:
+                    future_to_link = {
+                        executor.submit(extract_doc_text, prefetch_cache[link]): link
+                        for link in docs_to_extract
+                    }
+                    for future in as_completed(future_to_link):
+                        link = future_to_link[future]
+                        try:
+                            extract_text, status_value = future.result()
+                        except Exception as e:
+                            print(f"  [extract] Extraction failed for {link}: {e}")
+                            extract_text, status_value = "Content not available", STATUS_NONE
+                        extracted_result_cache[link] = (extract_text, status_value)
+
+            prefetch_cache.clear()
+            del prefetch_cache
+
+        # ASSEMBLE NEW VALUES
+        new_extraction_values = {}
+        new_status_values = {}
+
+        for sheet_row_number, cin in rows_to_skip:
+            new_extraction_values[sheet_row_number] = "Skipped"
+            new_status_values[sheet_row_number] = STATUS_SKIPPED
+
+        for sheet_row_number, cin, drive_link in row_infos:
+            if cin in successful_cins:
+                new_extraction_values[sheet_row_number] = "Skipped"
+                new_status_values[sheet_row_number] = STATUS_SKIPPED
+                continue
+
+            extract_text, status_value = extracted_result_cache.get(
+                drive_link, ("Content not available", STATUS_NONE)
+            )
+            new_extraction_values[sheet_row_number] = truncate_for_sheet_cell(extract_text)
+            new_status_values[sheet_row_number] = status_value
+
+            if status_value == STATUS_CLAUSE_MATCHED:
+                successful_cins.add(cin)
+
+        write_column_values(
+            input_sheet, batch_start, batch_end, extraction_idx,
+            chunk_rows, new_extraction_values, EXTRACTION_HEADER,
+        )
+        write_column_values(
+            input_sheet, batch_start, batch_end, status_idx,
+            chunk_rows, new_status_values, STATUS_HEADER,
         )
 
-        idx += len(chunk)
-        processed += len(chunk)
-        print(f"Progress: {processed}/{total}")
+        del (
+            chunk_rows,
+            row_infos,
+            rows_to_skip,
+            unique_links,
+            extracted_result_cache,
+            new_extraction_values,
+            new_status_values,
+        )
+        gc.collect()
 
-        time.sleep(CONFIG["SLEEP_BETWEEN_BATCHES"])
+        current_row = batch_end + 1
 
-    print(f"Sheet '{CONFIG['SHEET_NAME']}' completed. All rows processed.")
-    mark_master_row_done(sheets_service, master_row, CONFIG["MASTER_EXTRACTION_STATUS_COL_LETTER"])
+    print(f"\nSheet '{sheet_name}' done.")
+    mark_master_row_done(client, master_row, MASTER_EXTRACTION_STATUS_COL_LETTER)
 
 
 def main():
-    print("Authenticating...")
-    creds = get_credentials()
-    sheets_service = get_sheets_service(creds)
-    drive_service = get_drive_service(creds)
+    client = gspread_auth()
+    drive_creds = drive_credentials()
 
     while True:
-        print(f"Looking up sheet for user '{CONFIG['USER_NAME']}'...")
-        target = get_next_extraction_sheet(sheets_service, CONFIG["USER_NAME"])
+        print(f"\nLooking up sheet for user '{USER_NAME}'...")
+        target = get_next_extraction_sheet(client, USER_NAME)
         if not target:
             print(
-                f"No in-progress row for extraction User='{CONFIG['USER_NAME']}' and no "
-                f"unclaimed row available in '{CONFIG['MASTER_SHEET_TAB']}'. All done."
+                f"No in-progress row for extraction User='{USER_NAME}' and no unclaimed "
+                f"row available in '{MASTER_SHEET_TAB}'. All done."
             )
             break
 
-        CONFIG["SHEET_ID"], CONFIG["SHEET_NAME"], master_row = target
-        print(f"Target sheet: {CONFIG['SHEET_ID']} (tab: {CONFIG['SHEET_NAME']})")
+        spreadsheet_id, sheet_name, master_row = target
+        print(f"Target sheet: {spreadsheet_id} (tab: {sheet_name})")
 
-        process_one_sheet(sheets_service, drive_service, master_row)
+        process_sheet(client, drive_creds, spreadsheet_id, sheet_name, master_row)
         # Loop back around to pick up the next sheet for this user.
 
 
