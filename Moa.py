@@ -42,16 +42,43 @@ import google.auth.transport.requests as google_requests
 # START_ROW = 2
 # ---------------- Railway Configuration ----------------
 
-GOOGLE_SERVICE_ACCOUNT_INFO = json.loads(
-    os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
-)
-
 # The sheet to process is no longer fixed by env vars -- it's picked up
 # dynamically from the master "Sheet List" spreadsheet (see MASTER_* below
 # and get_next_extraction_sheet()). Only USER_NAME needs to be set.
 USER_NAME = os.environ.get("USER_NAME")
 
 START_ROW = int(os.getenv("START_ROW", "2"))
+
+# ---------------- Multiple service accounts ----------------
+# Supports one or more service accounts so that if one lacks access to a
+# given spreadsheet or Drive file, the script automatically falls back to
+# the next one instead of failing outright.
+#
+# Set GOOGLE_SERVICE_ACCOUNT_JSON (required, first/primary account) and
+# optionally GOOGLE_SERVICE_ACCOUNT_JSON_2, GOOGLE_SERVICE_ACCOUNT_JSON_3,
+# etc. for additional accounts to fall back to, in order.
+
+
+def _load_service_account_infos():
+    infos = []
+
+    primary = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not primary:
+        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON environment variable is not set.")
+    infos.append(json.loads(primary))
+
+    idx = 2
+    while True:
+        raw = os.environ.get(f"GOOGLE_SERVICE_ACCOUNT_JSON_{idx}")
+        if not raw:
+            break
+        infos.append(json.loads(raw))
+        idx += 1
+
+    return infos
+
+
+SERVICE_ACCOUNT_INFOS = _load_service_account_infos()
 
 # ---------------- Master sheet ("Sheet List") config ----------------
 # Header row: Doc Type | Sheet Link | User | Drive Link Status | extraction User | Extarction status
@@ -121,6 +148,25 @@ SHEETS_SCOPES = [
 ]
 
 
+def is_permission_error(exc) -> bool:
+    """True if exc looks like a 403 / PERMISSION_DENIED response -- the
+    kind of error where retrying with the SAME credentials is pointless,
+    but trying a DIFFERENT service account might succeed."""
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None) if response is not None else None
+    if status == 403:
+        return True
+    try:
+        body = exc.args[0] if exc.args else {}
+        if isinstance(body, dict):
+            api_status = str(body.get("error", {}).get("status", "")).upper()
+            if api_status == "PERMISSION_DENIED":
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def call_with_retry(func, *args, **kwargs):
     last_exc = None
     for attempt in range(1, SHEETS_MAX_RETRIES + 1):
@@ -131,6 +177,10 @@ def call_with_retry(func, *args, **kwargs):
                 OSError,
                 gspread.exceptions.APIError,
         ) as e:
+            if is_permission_error(e):
+                # Retrying with the same credentials won't help -- let the
+                # caller's account-fallback logic decide what to try next.
+                raise
             last_exc = e
             if attempt == SHEETS_MAX_RETRIES:
                 break
@@ -144,17 +194,21 @@ def call_with_retry(func, *args, **kwargs):
 
 # ---------------- AUTH ----------------
 
-def gspread_auth():
-    creds = Credentials.from_service_account_info(GOOGLE_SERVICE_ACCOUNT_INFO, scopes=SHEETS_SCOPES)
-    return gspread.authorize(creds)
+SHEETS_CLIENTS = [
+    gspread.authorize(Credentials.from_service_account_info(info, scopes=SHEETS_SCOPES))
+    for info in SERVICE_ACCOUNT_INFOS
+]
 
 
-def drive_credentials():
-    """Separate Credentials object (readonly Drive scope) that we refresh
-    manually and reuse across threads for downloading file bytes."""
-    creds = Credentials.from_service_account_info(GOOGLE_SERVICE_ACCOUNT_INFO, scopes=DRIVE_SCOPES)
+def _build_drive_credentials(info):
+    creds = Credentials.from_service_account_info(info, scopes=DRIVE_SCOPES)
     creds.refresh(google_requests.Request())
     return creds
+
+
+DRIVE_CREDENTIALS_LIST = [_build_drive_credentials(info) for info in SERVICE_ACCOUNT_INFOS]
+
+print(f"Loaded {len(SERVICE_ACCOUNT_INFOS)} service account(s) for Sheets/Drive access.")
 
 
 def drive_auth_header(creds: Credentials) -> dict:
@@ -162,6 +216,28 @@ def drive_auth_header(creds: Credentials) -> dict:
     if not creds.valid:
         creds.refresh(google_requests.Request())
     return {"Authorization": f"Bearer {creds.token}"}
+
+
+def run_with_account_fallback(operation):
+    """
+    Calls operation(client) for each configured Sheets client in order.
+    On a permission-denied error, moves on to the next service account.
+    Any other exception (already retried internally via call_with_retry)
+    propagates immediately.
+    """
+    last_exc = None
+    for idx, client in enumerate(SHEETS_CLIENTS):
+        try:
+            return operation(client)
+        except Exception as e:
+            last_exc = e
+            if is_permission_error(e):
+                print(f"  [auth] Service account #{idx + 1} was denied access ({e}); trying next account...")
+                continue
+            raise
+    raise RuntimeError(
+        f"None of the {len(SHEETS_CLIENTS)} configured service account(s) have access."
+    ) from last_exc
 
 
 # ---------------- MASTER SHEET RESOLUTION ----------------
@@ -181,29 +257,35 @@ def extract_sheet_id_and_gid(url: str):
     return sheet_id, gid
 
 
-def get_sheet_title_from_gid(client, spreadsheet_id, gid) -> str:
-    """Resolves a tab's title from its gid by listing worksheets."""
-    spreadsheet = call_with_retry(client.open_by_key, spreadsheet_id)
-    worksheets = call_with_retry(spreadsheet.worksheets)
-    for ws in worksheets:
-        if ws.id == gid:
-            return ws.title
+def get_sheet_title_from_gid(spreadsheet_id, gid) -> str:
+    """Resolves a tab's title from its gid by listing worksheets, trying
+    each configured service account until one has access."""
+    def op(client):
+        spreadsheet = call_with_retry(client.open_by_key, spreadsheet_id)
+        worksheets = call_with_retry(spreadsheet.worksheets)
+        for ws in worksheets:
+            if ws.id == gid:
+                return ws.title
+        # Fallback: gid wasn't found (e.g. link had no #gid=), use the first tab.
+        if worksheets:
+            return worksheets[0].title
+        raise ValueError(f"No tabs found in spreadsheet {spreadsheet_id}")
 
-    # Fallback: gid wasn't found (e.g. link had no #gid=), use the first tab.
-    if worksheets:
-        return worksheets[0].title
-
-    raise ValueError(f"No tabs found in spreadsheet {spreadsheet_id}")
-
-
-def get_master_worksheet(client):
-    spreadsheet = call_with_retry(client.open_by_key, MASTER_SHEET_ID)
-    return call_with_retry(spreadsheet.worksheet, MASTER_SHEET_TAB)
+    return run_with_account_fallback(op)
 
 
-def set_master_row(client, row_number, user_col=None, status_col=None, user_name=None, status=None):
+def get_master_worksheet():
+    def op(client):
+        spreadsheet = call_with_retry(client.open_by_key, MASTER_SHEET_ID)
+        return call_with_retry(spreadsheet.worksheet, MASTER_SHEET_TAB)
+
+    return run_with_account_fallback(op)
+
+
+def set_master_row(row_number, user_col=None, status_col=None, user_name=None, status=None):
     """Writes to a master 'Sheet List' row: the given user/status column
-    letters. Pass only the fields you want to update."""
+    letters. Pass only the fields you want to update. Tries each configured
+    service account until one has write access."""
     data = []
     if user_name is not None and user_col is not None:
         data.append({"range": f"{user_col}{row_number}", "values": [[user_name]]})
@@ -212,17 +294,21 @@ def set_master_row(client, row_number, user_col=None, status_col=None, user_name
     if not data:
         return
 
-    ws = get_master_worksheet(client)
-    call_with_retry(ws.batch_update, data)
+    def op(client):
+        spreadsheet = call_with_retry(client.open_by_key, MASTER_SHEET_ID)
+        ws = call_with_retry(spreadsheet.worksheet, MASTER_SHEET_TAB)
+        call_with_retry(ws.batch_update, data)
+
+    run_with_account_fallback(op)
 
 
-def mark_master_row_done(client, row_number, status_col):
+def mark_master_row_done(row_number, status_col):
     """Marks a master-sheet row's status column as 'Done' once processing finishes."""
-    set_master_row(client, row_number, status_col=status_col, status="Done")
+    set_master_row(row_number, status_col=status_col, status="Done")
     print(f"  [master] Marked master row {row_number} (col {status_col}) as Done.")
 
 
-def get_target_sheet_from_master(client, user_name, user_col_idx, status_col_idx,
+def get_target_sheet_from_master(user_name, user_col_idx, status_col_idx,
                                   user_col_letter, status_col_letter):
     """
     Reads the master 'Sheet List' tab (Doc Type | Sheet Link | User |
@@ -241,7 +327,7 @@ def get_target_sheet_from_master(client, user_name, user_col_idx, status_col_idx
     if not user_name:
         raise ValueError("USER_NAME environment variable is not set.")
 
-    ws = get_master_worksheet(client)
+    ws = get_master_worksheet()
     rows = call_with_retry(ws.get, "A2:F")
 
     unclaimed_row_number = None
@@ -259,7 +345,7 @@ def get_target_sheet_from_master(client, user_name, user_col_idx, status_col_idx
             spreadsheet_id, gid = extract_sheet_id_and_gid(sheet_link)
             if not spreadsheet_id:
                 raise ValueError(f"Could not parse a spreadsheet ID from Sheet Link: {sheet_link}")
-            sheet_title = get_sheet_title_from_gid(client, spreadsheet_id, gid)
+            sheet_title = get_sheet_title_from_gid(spreadsheet_id, gid)
             print(
                 f"  [master] Found in-progress sheet for user '{user_name}': "
                 f"{sheet_link} -> tab '{sheet_title}' (master row {master_row_number})"
@@ -275,10 +361,10 @@ def get_target_sheet_from_master(client, user_name, user_col_idx, status_col_idx
         spreadsheet_id, gid = extract_sheet_id_and_gid(sheet_link)
         if not spreadsheet_id:
             raise ValueError(f"Could not parse a spreadsheet ID from Sheet Link: {sheet_link}")
-        sheet_title = get_sheet_title_from_gid(client, spreadsheet_id, gid)
+        sheet_title = get_sheet_title_from_gid(spreadsheet_id, gid)
 
         set_master_row(
-            client, unclaimed_row_number,
+            unclaimed_row_number,
             user_col=user_col_letter, status_col=status_col_letter,
             user_name=user_name, status="Processing",
         )
@@ -291,10 +377,10 @@ def get_target_sheet_from_master(client, user_name, user_col_idx, status_col_idx
     return None
 
 
-def get_next_extraction_sheet(client, user_name):
+def get_next_extraction_sheet(user_name):
     """Picks/resumes a sheet tracked via 'extraction User' / 'Extarction status' (E/F)."""
     return get_target_sheet_from_master(
-        client, user_name,
+        user_name,
         user_col_idx=MASTER_EXTRACTION_USER_COL_IDX,
         status_col_idx=MASTER_EXTRACTION_STATUS_COL_IDX,
         user_col_letter=MASTER_EXTRACTION_USER_COL_LETTER,
@@ -339,6 +425,15 @@ def download_drive_file_bytes(creds: Credentials, file_id: str) -> bytes:
             )
             response.raise_for_status()
             return response.content
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 403:
+                # Permission issue -- retrying with the same credentials
+                # won't help; let account-fallback logic try another one.
+                raise
+            last_exc = e
+            if attempt == DRIVE_MAX_RETRIES:
+                raise
+            time.sleep(DRIVE_RETRY_BASE_DELAY * (2 ** (attempt - 1)))
         except requests.exceptions.RequestException as e:
             last_exc = e
             if attempt == DRIVE_MAX_RETRIES:
@@ -347,9 +442,30 @@ def download_drive_file_bytes(creds: Credentials, file_id: str) -> bytes:
     raise last_exc
 
 
-def prefetch_drive_files(creds: Credentials, links: list) -> dict:
-    """Downloads bytes for each distinct Drive link in parallel.
-    Returns {link: bytes} -- links that fail to parse/download are omitted."""
+def download_drive_file_with_fallback(file_id: str) -> bytes:
+    """Tries each configured service account's Drive credentials in order;
+    moves to the next one on a 403, since that means THIS account lacks
+    access to THIS file (a different account might still have it)."""
+    last_exc = None
+    for idx, creds in enumerate(DRIVE_CREDENTIALS_LIST):
+        try:
+            return download_drive_file_bytes(creds, file_id)
+        except requests.exceptions.HTTPError as e:
+            last_exc = e
+            if e.response is not None and e.response.status_code == 403:
+                print(f"  [drive] Service account #{idx + 1} denied access to file {file_id}; trying next account...")
+                continue
+            raise
+    raise RuntimeError(
+        f"None of the {len(DRIVE_CREDENTIALS_LIST)} configured service account(s) "
+        f"could access Drive file {file_id}."
+    ) from last_exc
+
+
+def prefetch_drive_files(links: list) -> dict:
+    """Downloads bytes for each distinct Drive link in parallel, trying
+    every configured service account per file. Returns {link: bytes} --
+    links that fail to parse/download (with all accounts) are omitted."""
     results = {}
     if not links:
         return results
@@ -360,7 +476,7 @@ def prefetch_drive_files(creds: Credentials, links: list) -> dict:
             print(f"  [drive] Could not parse a file ID from link: {link}")
             return link, None
         try:
-            return link, download_drive_file_bytes(creds, file_id)
+            return link, download_drive_file_with_fallback(file_id)
         except Exception as e:
             print(f"  [drive] Download failed for {link} (file_id={file_id}): {e}")
             return link, None
@@ -546,11 +662,15 @@ def write_column_values(input_sheet, batch_start, batch_end, col_idx,
 
 # ---------------- MAIN ----------------
 
-def process_sheet(client, drive_creds, spreadsheet_id, sheet_name, master_row):
+def process_sheet(spreadsheet_id, sheet_name, master_row):
     """Runs the full extraction pass for one sheet, then marks its master
     row Done via the extraction status column."""
-    spreadsheet = call_with_retry(client.open_by_key, spreadsheet_id)
-    input_sheet = call_with_retry(spreadsheet.worksheet, sheet_name)
+
+    def open_sheet(client):
+        spreadsheet = call_with_retry(client.open_by_key, spreadsheet_id)
+        return call_with_retry(spreadsheet.worksheet, sheet_name)
+
+    input_sheet = run_with_account_fallback(open_sheet)
 
     header_row = call_with_retry(input_sheet.row_values, 1)
     if not header_row:
@@ -580,8 +700,23 @@ def process_sheet(client, drive_creds, spreadsheet_id, sheet_name, master_row):
     except Exception as e:
         print(f"Warning: Initial status pre-scan failed ({e}). Proceeding without seeding memory.")
 
-    current_row = START_ROW
-    print(f"\n--- Starting processing from row {START_ROW} ---")
+    # START_ROW is a single global env var, but the loop in main() picks up
+    # a different sheet (possibly much smaller) on every iteration. If a
+    # stale/oversized START_ROW is left set from a previous single-sheet
+    # run, blindly using it here would make the while-loop below never
+    # execute a single batch -- the sheet gets marked "Done" without a
+    # single row ever being processed. Guard against that.
+    if START_ROW > total_rows_in_sheet:
+        print(
+            f"  [warn] START_ROW ({START_ROW}) exceeds this sheet's row count "
+            f"({total_rows_in_sheet}). Falling back to row 2 so this sheet actually "
+            f"gets processed instead of being skipped and marked Done."
+        )
+        current_row = 2
+    else:
+        current_row = START_ROW
+
+    print(f"\n--- Starting processing from row {current_row} ---")
 
     while current_row <= total_rows_in_sheet:
         # Scoped per-batch so extracted text for previous batches is freed.
@@ -661,7 +796,7 @@ def process_sheet(client, drive_creds, spreadsheet_id, sheet_name, master_row):
 
         # PREFETCH & EXTRACT
         if unique_links:
-            prefetch_cache = prefetch_drive_files(drive_creds, unique_links)
+            prefetch_cache = prefetch_drive_files(unique_links)
 
             unresolved_links = unique_links - set(prefetch_cache.keys())
             for link in unresolved_links:
@@ -736,16 +871,13 @@ def process_sheet(client, drive_creds, spreadsheet_id, sheet_name, master_row):
         current_row = batch_end + 1
 
     print(f"\nSheet '{sheet_name}' done.")
-    mark_master_row_done(client, master_row, MASTER_EXTRACTION_STATUS_COL_LETTER)
+    mark_master_row_done(master_row, MASTER_EXTRACTION_STATUS_COL_LETTER)
 
 
 def main():
-    client = gspread_auth()
-    drive_creds = drive_credentials()
-
     while True:
         print(f"\nLooking up sheet for user '{USER_NAME}'...")
-        target = get_next_extraction_sheet(client, USER_NAME)
+        target = get_next_extraction_sheet(USER_NAME)
         if not target:
             print(
                 f"No in-progress row for extraction User='{USER_NAME}' and no unclaimed "
@@ -756,7 +888,7 @@ def main():
         spreadsheet_id, sheet_name, master_row = target
         print(f"Target sheet: {spreadsheet_id} (tab: {sheet_name})")
 
-        process_sheet(client, drive_creds, spreadsheet_id, sheet_name, master_row)
+        process_sheet(spreadsheet_id, sheet_name, master_row)
         # Loop back around to pick up the next sheet for this user.
 
 
