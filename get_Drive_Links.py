@@ -17,9 +17,9 @@ from googleapiclient.http import MediaIoBaseUpload
 # CONFIG
 # =========================================================
 CONFIG = {
-    # SHEET_ID / SHEET_NAME are now resolved at runtime from the master
-    # "Sheet List" spreadsheet (see get_target_sheet_from_master below),
-    # so they start out empty and get filled in inside main().
+    # SHEET_ID / SHEET_NAME are resolved per-iteration at runtime from the
+    # master "Sheet List" spreadsheet (see get_target_sheet_from_master),
+    # so they start out empty and get filled in inside the main loop.
     "SHEET_ID": None,
     "SHEET_NAME": None,
     "SERVICE_ACCOUNT_FILE": os.environ.get("SERVICE_ACCOUNT_FILE"),
@@ -43,6 +43,7 @@ CONFIG = {
     "MAX_WORKERS": 20,             # thread pool size for parallel fetches
 
     "SLEEP_BETWEEN_BATCHES": 0.25,  # seconds
+    "SLEEP_BETWEEN_SHEETS": 1.0,    # seconds, pause before picking up the next sheet
 
     "SKIP_ROWS_WITH_EXISTING_LINK": True,  # skip rows where col F is already filled
 }
@@ -608,32 +609,22 @@ def process_batch(batch, tokens, drive_service, folder_id, existing_files, exist
 
 
 # =========================================================
-# MAIN
+# PER-SHEET PIPELINE
 # =========================================================
-def main():
-    print("Authenticating...")
-    creds = get_credentials()
-    sheets_service = get_sheets_service(creds)
-    drive_service = get_drive_service(creds)
+def process_sheet(sheets_service, drive_service, target):
+    """
+    Runs the full download -> upload -> write-back pipeline for a single
+    master-sheet target, then marks that master row 'Done'.
 
-    print(f"Looking up sheet for user '{CONFIG['USER_NAME']}'...")
-    target = get_target_sheet_from_master(sheets_service, CONFIG["USER_NAME"])
-    if not target:
-        print(
-            f"No in-progress row for User='{CONFIG['USER_NAME']}' and no unclaimed "
-            f"row available in '{CONFIG['MASTER_SHEET_TAB']}'. Nothing to do."
-        )
-        return
-
+    target: (spreadsheet_id, sheet_title, master_row_number), as returned
+    by get_target_sheet_from_master.
+    """
     CONFIG["SHEET_ID"], CONFIG["SHEET_NAME"], master_row = target
-    print(f"Target sheet: {CONFIG['SHEET_ID']} (tab: {CONFIG['SHEET_NAME']})")
+    print(f"\n=== Processing sheet: {CONFIG['SHEET_ID']} (tab: {CONFIG['SHEET_NAME']}) ===")
 
     print("Reading tokens from Config sheet...")
     tokens = get_tokens(sheets_service)
     print(f"Loaded {len(tokens)} token(s).")
-
-    print("Checking Drive folder access...")
-    verify_folder_access(drive_service, CONFIG["DRIVE_FOLDER_ID"])
 
     print("Reading sheet values...")
     values = read_all_values(sheets_service)
@@ -661,8 +652,46 @@ def main():
 
         time.sleep(CONFIG["SLEEP_BETWEEN_BATCHES"])
 
-    print("Completed. All rows processed.")
+    print(f"Sheet complete: {CONFIG['SHEET_ID']} (tab: {CONFIG['SHEET_NAME']})")
     mark_master_row_done(sheets_service, master_row)
+
+
+# =========================================================
+# MAIN
+# =========================================================
+def main():
+    print("Authenticating...")
+    creds = get_credentials()
+    sheets_service = get_sheets_service(creds)
+    drive_service = get_drive_service(creds)
+
+    print("Checking Drive folder access...")
+    verify_folder_access(drive_service, CONFIG["DRIVE_FOLDER_ID"])
+
+    sheets_completed = 0
+    while True:
+        print(f"\nLooking up sheet for user '{CONFIG['USER_NAME']}'...")
+        target = get_target_sheet_from_master(sheets_service, CONFIG["USER_NAME"])
+        if not target:
+            print(
+                f"No in-progress row for User='{CONFIG['USER_NAME']}' and no unclaimed "
+                f"row available in '{CONFIG['MASTER_SHEET_TAB']}'. Nothing left to do."
+            )
+            break
+
+        try:
+            process_sheet(sheets_service, drive_service, target)
+        except Exception as e:
+            # Don't let one bad sheet kill the whole run -- log it, leave its
+            # master row as "Processing" so it can be resumed/investigated,
+            # and move on to the next unclaimed sheet.
+            _, _, master_row = target
+            print(f"Error processing master row {master_row}: {e}")
+
+        sheets_completed += 1
+        time.sleep(CONFIG["SLEEP_BETWEEN_SHEETS"])
+
+    print(f"\nAll available sheets processed. Sheets completed this run: {sheets_completed}")
 
 
 if __name__ == "__main__":
