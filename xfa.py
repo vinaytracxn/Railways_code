@@ -52,8 +52,8 @@ GOOGLE_SERVICE_ACCOUNT_INFO = GOOGLE_SERVICE_ACCOUNT_INFOS[0]
 # per-user claiming/progress so multiple runs/users can't double-process
 # the same child sheet. See process_master_workflow() / main().
 MASTER_SPREADSHEET_ID = "1oNr3g2Pjpyu9u09w0lCFVT9vJwbBGn8O2rbx4kvjd88"
-MASTER_SHEET_NAME = "Sheet List"                    # master tab name
-CURRENT_USER = os.environ.get("USER_NAME")                        # identifies this run's claims; change per user/machine
+MASTER_SHEET_NAME = "Sheet List"                # master tab name
+CURRENT_USER = os.environ.get("USER_NAME")      # identifies this run's claims; set per user/machine
 
 # Master sheet headers (in this order):
 #   Doc Type | Sheet Link | User | Drive Link Status | extraction User |
@@ -61,7 +61,7 @@ CURRENT_USER = os.environ.get("USER_NAME")                        # identifies t
 MASTER_SHEET_LINK_COL_LETTER = "B"
 MASTER_XFA_USER_COL_LETTER = "G"
 MASTER_XFA_STATUS_COL_LETTER = "H"
-MASTER_START_ROW = 6                                              # 1 if the master sheet has no header row
+MASTER_START_ROW = 6                            # 1 if the master sheet has no header row
 
 MASTER_STATUS_PROCESSING = "Processing"
 MASTER_STATUS_COMPLETED = "Done"
@@ -95,6 +95,7 @@ HIGHLIGHT_REQUEST_CHUNK_SIZE = 500              # requests per formatting batch_
 START_ROW = 2                                   # 1 if no header row
 BATCH_SIZE = 100                                # rows per outer processing window
 WRITE_BATCH_SIZE = 25                            # rows per batch_update call (sub-chunk of BATCH_SIZE)
+SKIP_WRITE_BATCH_SIZE = 200                      # rows per batch_update call for cheap duplicate-CIN skip writes
 MAX_WORKERS = 8                                  # concurrent PDF downloads
 # Small per-request delay, applied per worker thread rather than globally,
 # so we're still polite to the Drive API without serializing everything.
@@ -108,6 +109,23 @@ REQUEST_DELAY_SECONDS = 0.3
 MAX_DOWNLOAD_RETRIES = 4                # total attempts = 1 initial + this many retries
 RETRY_BACKOFF_BASE_SECONDS = 2          # backoff: 2s, 4s, 8s, 16s (doubling each retry)
 RETRYABLE_HTTP_STATUSES = {403, 429, 500, 502, 503, 504}
+
+# Retry settings for Sheets API calls (read AND write -- batch_update,
+# update_acell, col_values, open_by_key, worksheet, ...). Sheets enforces a
+# per-user "write requests per minute" quota (60/min by default); a burst of
+# many small batch_update calls back-to-back (e.g. writing thousands of
+# duplicate-CIN skip rows in 25-row chunks) can blow through that quota
+# well within a minute, and without retry the resulting 429 propagates
+# straight up and fails the whole child sheet. Backoff starts at a full
+# minute since the quota window is per-minute -- shorter waits just spend
+# the retry budget hitting the same still-active limit again.
+SHEETS_MAX_RETRIES = 6                          # total attempts = 1 initial + this many retries
+SHEETS_RETRY_BACKOFF_BASE_SECONDS = 60          # backoff: 60s, 120s, 240s, ... doubling each retry
+# Small fixed pacing delay between consecutive Sheets *write* calls issued
+# back-to-back in a loop (e.g. each 25-row skip-marker chunk), to spread
+# requests out and avoid tripping the per-minute quota in the first place
+# rather than only reacting to it after the fact.
+SHEETS_WRITE_PACING_SECONDS = 1.0
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -127,6 +145,45 @@ def build_service_account_creds_list() -> list[Credentials]:
     ]
 
 _thread_local = threading.local()
+
+
+def is_retryable_sheets_error(exc: Exception) -> bool:
+    """True for rate-limit (429) and transient server (5xx) errors from the
+    Sheets API. gspread raises gspread.exceptions.APIError, whose message
+    embeds the underlying Google API error JSON -- status code parsing is
+    best-effort (the response object isn't always present), so this also
+    falls back to matching on the well-known quota-error text."""
+    if isinstance(exc, gspread.exceptions.APIError):
+        try:
+            status = exc.response.status_code
+            if status in RETRYABLE_HTTP_STATUSES:
+                return True
+        except Exception:
+            pass
+    msg = str(exc)
+    return "429" in msg or "Quota exceeded" in msg or "RESOURCE_EXHAUSTED" in msg
+
+
+def with_sheets_retry(func, *args, **kwargs):
+    """Call any Sheets API function (gc.open_by_key, sh.worksheet,
+    ws.col_values, ws.batch_update, ws.update_acell, ...) with exponential
+    backoff on rate-limit/5xx errors. Non-retryable errors, and the last
+    attempt's error once SHEETS_MAX_RETRIES is exhausted, are re-raised
+    so callers' existing error handling still applies unchanged."""
+    last_exc = None
+    for attempt in range(SHEETS_MAX_RETRIES + 1):  # attempt 0 = first try
+        try:
+            return func(*args, **kwargs)
+        except Exception as exc:
+            last_exc = exc
+            if not is_retryable_sheets_error(exc) or attempt == SHEETS_MAX_RETRIES:
+                raise
+            wait = SHEETS_RETRY_BACKOFF_BASE_SECONDS * (2 ** attempt)
+            print(f"    [sheets retry] {type(exc).__name__}: {exc} -- "
+                  f"attempt {attempt + 1}/{SHEETS_MAX_RETRIES + 1}, waiting {wait}s...")
+            time.sleep(wait)
+
+    raise last_exc if last_exc else RuntimeError("Unknown Sheets API failure")
 
 
 def col_letter_to_index(letter: str) -> int:
@@ -159,11 +216,11 @@ def open_child_worksheet(gc, spreadsheet_id: str):
     each entry in CHILD_SHEET_NAME_CANDIDATES in order ('Actual Sheet'
     first, then 'Sheet1'). Raises gspread.WorksheetNotFound if none of the
     candidates exist."""
-    sh = gc.open_by_key(spreadsheet_id)
+    sh = with_sheets_retry(gc.open_by_key, spreadsheet_id)
     last_exc = None
     for name in CHILD_SHEET_NAME_CANDIDATES:
         try:
-            return sh, sh.worksheet(name)
+            return sh, with_sheets_retry(sh.worksheet, name)
         except gspread.exceptions.WorksheetNotFound as exc:
             last_exc = exc
             continue
@@ -680,27 +737,33 @@ def highlight_content_not_available_rows(
     print(f"\n=== Highlighting {len(flagged_rows)} '{RETRY_TRIGGER_VALUE}' row(s) "
           f"({len(runs)} contiguous run(s)) in cream ===")
     for i in range(0, len(requests), HIGHLIGHT_REQUEST_CHUNK_SIZE):
-        sh.batch_update({"requests": requests[i : i + HIGHLIGHT_REQUEST_CHUNK_SIZE]})
+        with_sheets_retry(sh.batch_update, {"requests": requests[i : i + HIGHLIGHT_REQUEST_CHUNK_SIZE]})
+        time.sleep(SHEETS_WRITE_PACING_SECONDS)
     print("  -> highlighting applied.")
 
 
 def write_skip_rows(ws, skip_rows: list[int]) -> None:
     """Write the CIN-dedup 'Skipped' marker directly to G/H for rows that
-    are never downloaded/processed at all, in WRITE_BATCH_SIZE chunks so a
-    huge dedup list can't blow past batch_update payload limits."""
+    are never downloaded/processed at all, in SKIP_WRITE_BATCH_SIZE chunks
+    so a huge dedup list can't blow past batch_update payload limits. Each
+    chunk is a plain value write (no formatting), so a much bigger chunk
+    size than WRITE_BATCH_SIZE is safe here and keeps the request COUNT
+    down -- the Sheets API's per-minute quota is on requests, not cells, so
+    fewer/bigger batch_update calls matter more than payload size."""
     if not skip_rows:
         return
 
     print(f"\n=== Writing {len(skip_rows)} duplicate-CIN skip row(s) "
           f"(G='{SKIP_VALUE}', H='{SKIP_STATUS_VALUE}') ===")
-    for i in range(0, len(skip_rows), WRITE_BATCH_SIZE):
-        sub = skip_rows[i : i + WRITE_BATCH_SIZE]
+    for i in range(0, len(skip_rows), SKIP_WRITE_BATCH_SIZE):
+        sub = skip_rows[i : i + SKIP_WRITE_BATCH_SIZE]
         batch_updates = []
         for row in sub:
             batch_updates.append({"range": f"{OUTPUT_COL_LETTER}{row}", "values": [[SKIP_VALUE]]})
             batch_updates.append({"range": f"{STATUS_COL_LETTER}{row}", "values": [[SKIP_STATUS_VALUE]]})
-        ws.batch_update(batch_updates, value_input_option="RAW")
+        with_sheets_retry(ws.batch_update, batch_updates, value_input_option="RAW")
         print(f"  -> wrote skip marker for rows {sub[0]}-{sub[-1]} ({len(sub)} row(s))")
+        time.sleep(SHEETS_WRITE_PACING_SECONDS)
 
 
 def process_child_sheet(gc, creds_list: list[Credentials], spreadsheet_id: str) -> None:
@@ -718,9 +781,9 @@ def process_child_sheet(gc, creds_list: list[Credentials], spreadsheet_id: str) 
     link_col_idx = col_letter_to_index(LINK_COL_LETTER)
     output_col_idx = col_letter_to_index(OUTPUT_COL_LETTER)
 
-    col_a_values = ws.col_values(cin_col_idx)
-    col_f_values = ws.col_values(link_col_idx)
-    col_g_values = ws.col_values(output_col_idx)
+    col_a_values = with_sheets_retry(ws.col_values, cin_col_idx)
+    col_f_values = with_sheets_retry(ws.col_values, link_col_idx)
+    col_g_values = with_sheets_retry(ws.col_values, output_col_idx)
 
     # Highlight every row currently sitting at "Content not available"
     # (cream, G:H) before anything else touches the sheet, so it reflects
@@ -815,10 +878,11 @@ def process_child_sheet(gc, creds_list: list[Credentials], spreadsheet_id: str) 
                 batch_updates.append({"range": f"{OUTPUT_COL_LETTER}{row}", "values": [[cell_value]]})
                 batch_updates.append({"range": f"{STATUS_COL_LETTER}{row}", "values": [[STATUS_VALUE]]})
 
-            ws.batch_update(batch_updates, value_input_option="RAW")
+            with_sheets_retry(ws.batch_update, batch_updates, value_input_option="RAW")
             print(f"  -> wrote {len(sub_chunk)} row(s) "
                   f"({OUTPUT_COL_LETTER}{sub_chunk[0][0]}:{OUTPUT_COL_LETTER}{sub_chunk[-1][0]}, "
                   f"{STATUS_COL_LETTER} set to '{STATUS_VALUE}')")
+            time.sleep(SHEETS_WRITE_PACING_SECONDS)
 
     print(f"\n########## Done with child sheet: '{ws.title}' "
           f"(spreadsheet {spreadsheet_id}) ##########")
@@ -844,9 +908,9 @@ def claim_next_master_row(master_ws) -> dict | None:
     user_col_idx = col_letter_to_index(MASTER_XFA_USER_COL_LETTER)
     status_col_idx = col_letter_to_index(MASTER_XFA_STATUS_COL_LETTER)
 
-    link_values = master_ws.col_values(link_col_idx)
-    user_values = master_ws.col_values(user_col_idx)
-    status_values = master_ws.col_values(status_col_idx)
+    link_values = with_sheets_retry(master_ws.col_values, link_col_idx)
+    user_values = with_sheets_retry(master_ws.col_values, user_col_idx)
+    status_values = with_sheets_retry(master_ws.col_values, status_col_idx)
 
     def cell(values: list[str], row: int) -> str:
         return values[row - 1].strip() if row - 1 < len(values) else ""
@@ -884,8 +948,8 @@ def claim_next_master_row(master_ws) -> dict | None:
         if entry is None:
             continue
 
-        master_ws.update_acell(f"{MASTER_XFA_USER_COL_LETTER}{row}", CURRENT_USER)
-        master_ws.update_acell(f"{MASTER_XFA_STATUS_COL_LETTER}{row}", MASTER_STATUS_PROCESSING)
+        with_sheets_retry(master_ws.update_acell, f"{MASTER_XFA_USER_COL_LETTER}{row}", CURRENT_USER)
+        with_sheets_retry(master_ws.update_acell, f"{MASTER_XFA_STATUS_COL_LETTER}{row}", MASTER_STATUS_PROCESSING)
         print(f"[master row {row}] claimed for user '{CURRENT_USER}'.")
         return entry
 
@@ -893,8 +957,8 @@ def claim_next_master_row(master_ws) -> dict | None:
 
 
 def update_master_status(master_ws, row: int, status: str) -> None:
-    """Write XFA Status for a single master row (Completed / Failed)."""
-    master_ws.update_acell(f"{MASTER_XFA_STATUS_COL_LETTER}{row}", status)
+    """Write XFA Status for a single master row (Done / Failed)."""
+    with_sheets_retry(master_ws.update_acell, f"{MASTER_XFA_STATUS_COL_LETTER}{row}", status)
 
 
 def process_master_workflow() -> None:
@@ -911,8 +975,8 @@ def process_master_workflow() -> None:
     creds_list = build_service_account_creds_list()
     gc = gspread.authorize(creds_list[0])  # primary account handles Sheets I/O
 
-    master_sh = gc.open_by_key(MASTER_SPREADSHEET_ID)
-    master_ws = master_sh.worksheet(MASTER_SHEET_NAME)
+    master_sh = with_sheets_retry(gc.open_by_key, MASTER_SPREADSHEET_ID)
+    master_ws = with_sheets_retry(master_sh.worksheet, MASTER_SHEET_NAME)
 
     while True:
         entry = claim_next_master_row(master_ws)
